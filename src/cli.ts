@@ -44,7 +44,7 @@ function requireActiveSession(vgDir: string): string {
   const p = vgPaths(vgDir)
   const id = getCurrentId(p.current)
   if (!id) {
-    console.error('No active session. Run `whygent begin "<intent>"` first.')
+    console.error('No active session. Run `cogitlog begin "<intent>"` first.')
     process.exit(1)
   }
   return id
@@ -79,7 +79,7 @@ async function promptOutcome(): Promise<SessionOutcome> {
 
 const program = new Command()
 program
-  .name('whygent')
+  .name('cogitlog')
   .description('Semantic memory protocol for AI agents working in codebases')
   .version('0.1.0')
 
@@ -87,11 +87,11 @@ program
 
 program
   .command('init')
-  .description('Initialize .whygent/ in the current directory')
+  .description('Initialize .cogitlog/ in the current directory')
   .action(() => {
-    const vgDir = path.join(process.cwd(), '.whygent')
+    const vgDir = path.join(process.cwd(), '.cogitlog')
     if (fs.existsSync(vgDir)) {
-      console.log('.whygent/ already exists')
+      console.log('.cogitlog/ already exists')
       return
     }
     fs.mkdirSync(path.join(vgDir, 'sessions'), { recursive: true })
@@ -102,23 +102,23 @@ program
     fs.writeFileSync(path.join(vgDir, 'index.jsonl'), '')
     fs.writeFileSync(
       path.join(vgDir, 'AGENTS.md'),
-      'This repo uses whygent to track AI agent sessions.\n' +
-      'Run `whygent onboard` for usage instructions.\n',
+      'This repo uses cogitlog to track AI agent sessions.\n' +
+      'Run `cogitlog onboard` for usage instructions.\n',
     )
 
     // Root-level hint file — committed to source control so agents see it immediately
     const projectRoot = getGitRoot() ?? process.cwd()
-    const hintFile = path.join(projectRoot, 'WHYGENT')
+    const hintFile = path.join(projectRoot, 'COGITLOG')
     if (!fs.existsSync(hintFile)) {
       fs.writeFileSync(
         hintFile,
-        'This project uses whygent to log AI agent sessions.\n' +
-        'Run `whygent onboard` to see what that means and how to use it.\n',
+        'This project uses cogitlog to log AI agent sessions.\n' +
+        'Run `cogitlog onboard` to see what that means and how to use it.\n',
       )
-      console.log('Created WHYGENT (commit this file so agents can find it)')
+      console.log('Created COGITLOG (commit this file so agents can find it)')
     }
 
-    console.log('Initialized .whygent/')
+    console.log('Initialized .cogitlog/')
   })
 
 // ── begin ─────────────────────────────────────────────────────────────────────
@@ -138,7 +138,7 @@ program
     if (existingId) {
       const events = readEvents(p.session(existingId))
       if (!events.some(e => e.type === 'close')) {
-        console.error(`Session ${existingId} is already active. Close it first with \`whygent close\`.`)
+        console.error(`Session ${existingId} is already active. Close it first with \`cogitlog close\`.`)
         process.exit(1)
       }
     }
@@ -567,7 +567,7 @@ program
   .description('Show the current session status')
   .action(() => {
     const vgDir = findVibegitDir()
-    if (!vgDir) { console.log('Not a whygent repository'); return }
+    if (!vgDir) { console.log('Not a cogitlog repository'); return }
 
     const p = vgPaths(vgDir)
     resolveInterrupted(vgDir)
@@ -642,13 +642,13 @@ program
 
 program
   .command('onboard')
-  .description('Print usage instructions for agents unfamiliar with whygent')
+  .description('Print usage instructions for agents unfamiliar with cogitlog')
   .action(() => {
     console.log(`
-whygent — semantic session memory for AI agents
+cogitlog — semantic session memory for AI agents
 ================================================
 
-This repo records AI agent sessions in .whygent/ alongside git history.
+This repo records AI agent sessions in .cogitlog/ alongside git history.
 Each session captures intent, decisions, attempts, and uncertainties so
 future agents (and humans) can understand not just *what* changed but *why*.
 
@@ -656,36 +656,36 @@ EXPECTED BEHAVIOR
 -----------------
 At the start of every task, open a session:
 
-  whygent begin "<what you intend to do>" [--context "<extra background>"]
+  cogitlog begin "<what you intend to do>" [--context "<extra background>"]
 
 During the task, record meaningful events:
 
-  whygent note "<observation or progress update>"
-  whygent decision "<what you chose and why>" [-a "<option:reason rejected>"]
-  whygent attempt "<what you tried>" --outcome failed --reason "<why it failed>"
-  whygent uncertainty "<what you don't know or aren't confident about>"
+  cogitlog note "<observation or progress update>"
+  cogitlog decision "<what you chose and why>" [-a "<option:reason rejected>"]
+  cogitlog attempt "<what you tried>" --outcome failed --reason "<why it failed>"
+  cogitlog uncertainty "<what you don't know or aren't confident about>"
 
 At the end of the task, close the session:
 
-  whygent close --outcome <completed|partial|abandoned|interrupted> [--note "<summary>"]
+  cogitlog close --outcome <completed|partial|abandoned|interrupted> [--note "<summary>"]
 
 Use interrupted if you hit a context limit or are stopping mid-task.
-A future agent can resume with: whygent begin "<intent>" --resume <session-id>
+A future agent can resume with: cogitlog begin "<intent>" --resume <session-id>
 
 QUERYING HISTORY
 ----------------
-  whygent log                    # list recent sessions
-  whygent show [session-id]      # full detail of a session
-  whygent why <file>             # decisions that touched a file
-  whygent query "<text>"         # search by intent / outcome note
-  whygent query "<text>" --deep  # also search event bodies
+  cogitlog log                    # list recent sessions
+  cogitlog show [session-id]      # full detail of a session
+  cogitlog why <file>             # decisions that touched a file
+  cogitlog query "<text>"         # search by intent / outcome note
+  cogitlog query "<text>" --deep  # also search event bodies
 
 CURRENT STATUS
 --------------`)
 
     const vgDir = findVibegitDir()
     if (!vgDir) {
-      console.log('  No .whygent/ found in this directory tree.\n  Run `whygent init` to initialize.\n')
+      console.log('  No .cogitlog/ found in this directory tree.\n  Run `cogitlog init` to initialize.\n')
       return
     }
     const p = vgPaths(vgDir)
@@ -710,15 +710,15 @@ CURRENT STATUS
 
 // ── hook ─────────────────────────────────────────────────────────────────────
 
-const hookCmd = program.command('hook').description('Manage git hooks for whygent')
+const hookCmd = program.command('hook').description('Manage git hooks for cogitlog')
 
 const POST_COMMIT_SCRIPT = [
   '#!/bin/sh',
-  '# whygent post-commit hook — auto-closes active session on commit',
-  'if command -v whygent >/dev/null 2>&1; then',
+  '# cogitlog post-commit hook — auto-closes active session on commit',
+  'if command -v cogitlog >/dev/null 2>&1; then',
   '  COMMIT=$(git rev-parse HEAD 2>/dev/null)',
   '  SUBJECT=$(git log -1 --format=%s 2>/dev/null)',
-  '  whygent close --outcome completed --note "Committed: $SUBJECT ($COMMIT)" 2>/dev/null || true',
+  '  cogitlog close --outcome completed --note "Committed: $SUBJECT ($COMMIT)" 2>/dev/null || true',
   'fi',
 ].join('\n')
 
@@ -733,7 +733,7 @@ hookCmd
 
     if (fs.existsSync(hookFile)) {
       const existing = fs.readFileSync(hookFile, 'utf8')
-      if (existing.includes('whygent')) { console.log('Hook already installed'); return }
+      if (existing.includes('cogitlog')) { console.log('Hook already installed'); return }
       fs.appendFileSync(hookFile, '\n' + POST_COMMIT_SCRIPT + '\n')
     } else {
       fs.writeFileSync(hookFile, POST_COMMIT_SCRIPT + '\n', 'utf8')
@@ -745,7 +745,7 @@ hookCmd
 
 hookCmd
   .command('uninstall')
-  .description('Remove whygent lines from post-commit hook')
+  .description('Remove cogitlog lines from post-commit hook')
   .action(() => {
     const gitRoot = getGitRoot()
     if (!gitRoot) { console.error('Not inside a git repository'); process.exit(1) }
@@ -754,12 +754,12 @@ hookCmd
     if (!fs.existsSync(hookFile)) { console.log('No post-commit hook found'); return }
 
     const content = fs.readFileSync(hookFile, 'utf8')
-    if (!content.includes('whygent')) { console.log('No whygent hook found'); return }
+    if (!content.includes('cogitlog')) { console.log('No cogitlog hook found'); return }
 
-    const whygentLines = new Set(POST_COMMIT_SCRIPT.split('\n'))
-    const filtered = content.split('\n').filter(line => !whygentLines.has(line)).join('\n')
+    const cogitlogLines = new Set(POST_COMMIT_SCRIPT.split('\n'))
+    const filtered = content.split('\n').filter(line => !cogitlogLines.has(line)).join('\n')
     fs.writeFileSync(hookFile, filtered, 'utf8')
-    console.log('Removed whygent hook')
+    console.log('Removed cogitlog hook')
   })
 
 // ─────────────────────────────────────────────────────────────────────────────

@@ -1,9 +1,9 @@
 {
-  "name": "whygent",
+  "name": "cogitlog",
   "version": "0.2.0",
   "description": "Semantic memory protocol for AI agents working in codebases",
   "bin": {
-    "whygent": "dist/cli.js"
+    "cogitlog": "dist/cli.js"
   },
   "scripts": {
     "build": "tsc && chmod +x dist/cli.js",

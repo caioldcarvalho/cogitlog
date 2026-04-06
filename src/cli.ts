@@ -100,6 +100,11 @@ program
       JSON.stringify({ spec_version: SPEC_VERSION, created_at: now() }, null, 2) + '\n',
     )
     fs.writeFileSync(path.join(vgDir, 'index.jsonl'), '')
+    fs.writeFileSync(
+      path.join(vgDir, 'AGENTS.md'),
+      'This repo uses vibegit to track AI agent sessions.\n' +
+      'Run `vibegit onboard` for usage instructions.\n',
+    )
     console.log('Initialized .vibegit/')
   })
 
@@ -618,6 +623,76 @@ program
 
     writeIndex(p.index, entries)
     console.log(`Rebuilt index: ${entries.length} session(s)`)
+  })
+
+// ── onboard ───────────────────────────────────────────────────────────────────
+
+program
+  .command('onboard')
+  .description('Print usage instructions for agents unfamiliar with vibegit')
+  .action(() => {
+    console.log(`
+vibegit — semantic session memory for AI agents
+================================================
+
+This repo records AI agent sessions in .vibegit/ alongside git history.
+Each session captures intent, decisions, attempts, and uncertainties so
+future agents (and humans) can understand not just *what* changed but *why*.
+
+EXPECTED BEHAVIOR
+-----------------
+At the start of every task, open a session:
+
+  vibegit begin "<what you intend to do>" [--context "<extra background>"]
+
+During the task, record meaningful events:
+
+  vibegit note "<observation or progress update>"
+  vibegit decision "<what you chose and why>" [-a "<option:reason rejected>"]
+  vibegit attempt "<what you tried>" --outcome failed --reason "<why it failed>"
+  vibegit uncertainty "<what you don't know or aren't confident about>"
+
+At the end of the task, close the session:
+
+  vibegit close --outcome <completed|partial|abandoned|interrupted> [--note "<summary>"]
+
+Use interrupted if you hit a context limit or are stopping mid-task.
+A future agent can resume with: vibegit begin "<intent>" --resume <session-id>
+
+QUERYING HISTORY
+----------------
+  vibegit log                    # list recent sessions
+  vibegit show [session-id]      # full detail of a session
+  vibegit why <file>             # decisions that touched a file
+  vibegit query "<text>"         # search by intent / outcome note
+  vibegit query "<text>" --deep  # also search event bodies
+
+CURRENT STATUS
+--------------`)
+
+    const vgDir = findVibegitDir()
+    if (!vgDir) {
+      console.log('  No .vibegit/ found in this directory tree.\n  Run `vibegit init` to initialize.\n')
+      return
+    }
+    const p = vgPaths(vgDir)
+    resolveInterrupted(vgDir)
+    const activeId = getCurrentId(p.current)
+    if (activeId) {
+      const events = readEvents(p.session(activeId))
+      const begin = events.find(e => e.type === 'begin') as any
+      console.log(`  Active session : ${activeId}`)
+      console.log(`  Intent         : ${begin?.intent ?? '(unknown)'}`)
+      console.log(`  Events so far  : ${events.length}`)
+    } else {
+      const entries = readIndex(p.index)
+      console.log(`  No active session.`)
+      if (entries.length > 0) {
+        const last = entries.sort((a, b) => (b.started_at > a.started_at ? 1 : -1))[0]
+        console.log(`  Last session   : ${last.session_id} — ${last.intent} (${last.outcome})`)
+      }
+    }
+    console.log('')
   })
 
 // ── hook ─────────────────────────────────────────────────────────────────────

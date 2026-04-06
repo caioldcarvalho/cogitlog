@@ -3,7 +3,7 @@
   "version": "0.2.0",
   "description": "Semantic memory protocol for AI agents working in codebases",
   "bin": {
-    "vibegit": "./dist/cli.js"
+    "vibegit": "dist/cli.js"
   },
   "scripts": {
     "build": "tsc && chmod +x dist/cli.js",

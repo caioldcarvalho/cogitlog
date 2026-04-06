@@ -110,7 +110,8 @@ program
   .description('Open a new session')
   .option('-c, --context <text>', 'Additional context')
   .option('-r, --resume <session-id>', 'Session this continues (resumed_from)')
-  .action(async (intent: string, opts: { context?: string; resume?: string }) => {
+  .option('-t, --tag <tag>', 'Tag — repeatable', collect, [] as string[])
+  .action(async (intent: string, opts: { context?: string; resume?: string; tag: string[] }) => {
     const vgDir = requireVibegitDir()
     const p = vgPaths(vgDir)
     resolveInterrupted(vgDir)
@@ -152,7 +153,7 @@ program
       outcome: 'in_progress',
       outcome_note: null,
       files: [],
-      tags: [],
+      tags: opts.tag,
     }
     await appendIndex(p.index, p.lock, entry)
 
@@ -188,10 +189,25 @@ program
   .command('decision <text>')
   .description('Record a decision')
   .option('-f, --file <path>', 'File reference — repeatable', collect, [] as string[])
-  .action(async (text: string, opts: { file: string[] }) => {
+  .option(
+    '-a, --alternative <option:reason>',
+    'Rejected alternative — format "option:reason", repeatable (colon separates at first occurrence)',
+    collect,
+    [] as string[],
+  )
+  .action(async (text: string, opts: { file: string[]; alternative: string[] }) => {
     const vgDir = requireVibegitDir()
     const p = vgPaths(vgDir)
     const sessionId = requireActiveSession(vgDir)
+
+    const alternatives = opts.alternative.map(raw => {
+      const idx = raw.indexOf(':')
+      if (idx === -1) {
+        console.error(`--alternative must be in "option:reason" format, got: ${raw}`)
+        process.exit(1)
+      }
+      return { option: raw.slice(0, idx), reason_rejected: raw.slice(idx + 1) }
+    })
 
     const event: SessionEvent = {
       session_id: sessionId,
@@ -199,7 +215,7 @@ program
       type: 'decision',
       at: now(),
       body: text,
-      alternatives: [],
+      alternatives,
       files: fileRefs(opts.file, getGitRoot()),
     }
     appendEvent(p.session(sessionId), event)
@@ -268,7 +284,8 @@ program
   .description('Close the current session')
   .option('--outcome <outcome>', 'completed | partial | abandoned | interrupted')
   .option('--note <text>', 'Outcome note')
-  .action(async (opts: { outcome?: string; note?: string }) => {
+  .option('-t, --tag <tag>', 'Tag — repeatable (merged with tags from begin)', collect, [] as string[])
+  .action(async (opts: { outcome?: string; note?: string; tag: string[] }) => {
     const vgDir = requireVibegitDir()
     const p = vgPaths(vgDir)
     const sessionId = requireActiveSession(vgDir)
@@ -302,6 +319,11 @@ program
     const allEvents = readEvents(sessionFile)
     const begin = allEvents.find(e => e.type === 'begin') as any
 
+    // Merge tags from begin index entry (if any) with tags passed to close
+    const existingEntries = readIndex(p.index)
+    const existingEntry = existingEntries.find(e => e.session_id === sessionId)
+    const mergedTags = Array.from(new Set([...(existingEntry?.tags ?? []), ...opts.tag]))
+
     const entry: IndexEntry = {
       session_id: sessionId,
       index_version: 2,
@@ -313,7 +335,7 @@ program
       outcome,
       outcome_note: opts.note ?? null,
       files: deriveFiles(allEvents),
-      tags: [],
+      tags: mergedTags,
     }
     await appendIndex(p.index, p.lock, entry)
     await clearCurrentId(p.current, p.lock)
@@ -355,6 +377,74 @@ program
             console.log(`     ✗ ${alt.option}: ${alt.reason_rejected}`)
           }
         }
+      }
+    }
+  })
+
+// ── show ──────────────────────────────────────────────────────────────────────
+
+program
+  .command('show [session-id]')
+  .description('Show full details of a session (defaults to current session)')
+  .option('--json', 'Output raw JSONL events')
+  .action((sessionId: string | undefined, opts: { json?: boolean }) => {
+    const vgDir = requireVibegitDir()
+    const p = vgPaths(vgDir)
+
+    let id = sessionId
+    if (!id) {
+      resolveInterrupted(vgDir)
+      id = getCurrentId(p.current) ?? undefined
+      if (!id) {
+        console.error('No active session and no session-id given.')
+        process.exit(1)
+      }
+    }
+
+    const sessionFile = p.session(id)
+    if (!fs.existsSync(sessionFile)) {
+      console.error(`Session not found: ${id}`)
+      process.exit(1)
+    }
+
+    const events = readEvents(sessionFile)
+
+    if (opts.json) {
+      for (const e of events) console.log(JSON.stringify(e))
+      return
+    }
+
+    const begin = events.find(e => e.type === 'begin') as any
+    const close = events.find(e => e.type === 'close') as any
+    const entries = readIndex(p.index)
+    const entry = entries.find(e => e.session_id === id)
+
+    console.log(`Session : ${id}`)
+    console.log(`Intent  : ${begin?.intent ?? '(unknown)'}`)
+    if (begin?.context) console.log(`Context : ${begin.context}`)
+    if (begin?.resumed_from) console.log(`Resumed : ${begin.resumed_from}`)
+    console.log(`Outcome : ${close?.outcome ?? entry?.outcome ?? 'in_progress'}`)
+    if (close?.outcome_note) console.log(`Note    : ${close.outcome_note}`)
+    if (entry?.tags?.length) console.log(`Tags    : ${entry.tags.join(', ')}`)
+    console.log(`Files   : ${entry?.files?.join(', ') || '(none)'}`)
+    console.log('')
+
+    for (const e of events) {
+      if (e.type === 'begin' || e.type === 'close') continue
+      const ts = e.at.slice(11, 16) // HH:MM
+      const body = (e as any).body ?? ''
+      console.log(`[${ts}] ${e.type.toUpperCase().padEnd(11)} ${body}`)
+      if (e.type === 'decision' && e.alternatives.length > 0) {
+        for (const alt of e.alternatives) {
+          console.log(`             ✗ ${alt.option}: ${alt.reason_rejected}`)
+        }
+      }
+      if (e.type === 'attempt') {
+        const reason = e.reason ? ` — ${e.reason}` : ''
+        console.log(`             outcome: ${e.outcome}${reason}`)
+      }
+      if ('files' in e && e.files.length > 0) {
+        console.log(`             files: ${e.files.map(f => f.path).join(', ')}`)
       }
     }
   })

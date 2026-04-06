@@ -85,6 +85,42 @@ program
 
 // ── init ─────────────────────────────────────────────────────────────────────
 
+// Known agent instruction files, in priority order.
+// Each entry is relative to the project root (or absolute if prefixed with /).
+const AGENT_INSTRUCTION_FILES = [
+  'CLAUDE.md',
+  'AGENTS.md',
+  'GEMINI.md',
+  'WINDSURF.md',
+  '.windsurfrules',
+  '.cursorrules',
+  '.github/copilot-instructions.md',
+]
+
+const COGITLOG_HINT = `
+## cogitlog
+
+This project uses [cogitlog](https://github.com/caiocarvalho/cogitlog) to log AI agent sessions.
+
+At the start of every task, open a session:
+  cogitlog begin "<what you intend to do>"
+
+Record meaningful events during the task:
+  cogitlog note / decision / attempt / uncertainty
+
+At the end, close the session:
+  cogitlog close --outcome <completed|partial|abandoned|interrupted>
+
+Run \`cogitlog onboard\` for full instructions.
+`
+
+function appendCogitlogHint(filePath: string): void {
+  const content = fs.readFileSync(filePath, 'utf8')
+  if (content.includes('cogitlog')) return // already mentioned
+  fs.appendFileSync(filePath, COGITLOG_HINT)
+  console.log(`  Appended cogitlog reminder → ${path.relative(process.cwd(), filePath)}`)
+}
+
 program
   .command('init')
   .description('Initialize .cogitlog/ in the current directory')
@@ -116,6 +152,19 @@ program
         'Run `cogitlog onboard` to see what that means and how to use it.\n',
       )
       console.log('Created COGITLOG (commit this file so agents can find it)')
+    }
+
+    // Append cogitlog hint to any existing agent instruction files
+    const found: string[] = []
+    for (const rel of AGENT_INSTRUCTION_FILES) {
+      const filePath = path.join(projectRoot, rel)
+      if (fs.existsSync(filePath)) {
+        appendCogitlogHint(filePath)
+        found.push(rel)
+      }
+    }
+    if (found.length > 0) {
+      console.log(`Updated ${found.length} agent instruction file(s) with cogitlog reminder`)
     }
 
     console.log('Initialized .cogitlog/')

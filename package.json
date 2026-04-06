@@ -1,6 +1,6 @@
 {
   "name": "vibegit",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Semantic memory protocol for AI agents working in codebases",
   "bin": {
     "vibegit": "./dist/cli.js"

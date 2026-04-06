@@ -105,6 +105,19 @@ program
       'This repo uses vibegit to track AI agent sessions.\n' +
       'Run `vibegit onboard` for usage instructions.\n',
     )
+
+    // Root-level hint file — committed to source control so agents see it immediately
+    const projectRoot = getGitRoot() ?? process.cwd()
+    const hintFile = path.join(projectRoot, 'VIBEGIT')
+    if (!fs.existsSync(hintFile)) {
+      fs.writeFileSync(
+        hintFile,
+        'This project uses vibegit to log AI agent sessions.\n' +
+        'Run `vibegit onboard` to see what that means and how to use it.\n',
+      )
+      console.log('Created VIBEGIT (commit this file so agents can find it)')
+    }
+
     console.log('Initialized .vibegit/')
   })
 

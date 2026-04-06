@@ -1,9 +1,9 @@
 {
-  "name": "vibegit",
+  "name": "whygent",
   "version": "0.2.0",
   "description": "Semantic memory protocol for AI agents working in codebases",
   "bin": {
-    "vibegit": "dist/cli.js"
+    "whygent": "dist/cli.js"
   },
   "scripts": {
     "build": "tsc && chmod +x dist/cli.js",

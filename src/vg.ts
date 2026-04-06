@@ -2,12 +2,12 @@ import fs from 'fs'
 import path from 'path'
 
 export const SPEC_VERSION = '0.3'
-export const AGENT_TOOL = 'vibegit-cli'
+export const AGENT_TOOL = 'whygent-cli'
 
 export function findVibegitDir(startDir = process.cwd()): string | null {
   let dir = startDir
   while (true) {
-    const candidate = path.join(dir, '.vibegit')
+    const candidate = path.join(dir, '.whygent')
     if (fs.existsSync(candidate) && fs.statSync(candidate).isDirectory()) return candidate
     const parent = path.dirname(dir)
     if (parent === dir) return null
@@ -18,7 +18,7 @@ export function findVibegitDir(startDir = process.cwd()): string | null {
 export function requireVibegitDir(): string {
   const dir = findVibegitDir()
   if (!dir) {
-    console.error('Not a vibegit repository. Run `vibegit init` first.')
+    console.error('Not a whygent repository. Run `whygent init` first.')
     process.exit(1)
   }
   return dir

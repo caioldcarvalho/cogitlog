@@ -53,11 +53,11 @@ export function resolveFileRefs(filePaths: string[], gitRoot?: string | null): F
   }))
 }
 
-/** Auto-detect changed files from git and return FileRef objects. Excludes .vibegit/ internals. */
+/** Auto-detect changed files from git and return FileRef objects. Excludes .whygent/ internals. */
 export function autoFileRefs(gitRoot?: string | null): FileRef[] {
   const head = getHead(gitRoot ?? undefined)
   return getChangedFiles(gitRoot ?? undefined)
-    .filter(p => !p.startsWith('.vibegit/'))
+    .filter(p => !p.startsWith('.whygent/'))
     .map(p => ({
       path: p,
       base_commit: head,

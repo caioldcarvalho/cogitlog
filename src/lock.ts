@@ -14,7 +14,7 @@ export async function withLock<T>(lockPath: string, fn: () => T | Promise<T>): P
 
 async function acquire(lockPath: string, retries: number): Promise<void> {
   if (retries >= MAX_RETRIES) {
-    throw new Error(`Could not acquire vibegit lock after ${MAX_RETRIES} retries: ${lockPath}`)
+    throw new Error(`Could not acquire whygent lock after ${MAX_RETRIES} retries: ${lockPath}`)
   }
 
   try {

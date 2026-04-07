@@ -20,6 +20,7 @@ import {
   writeIndex,
 } from './io'
 import { autoFileRefs, getGitRoot, getHead, resolveFileRefs } from './git'
+import { withLock } from './lock'
 import type { AttemptOutcome, FileRef, IndexEntry, SessionEvent, SessionOutcome } from './types'
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -522,15 +523,22 @@ program
 program
   .command('context <file>')
   .description('Show all events (decisions, attempts, notes, uncertainties) related to a file')
-  .action((file: string) => {
+  .option('--brief', 'Concise output — last 3 sessions, one line per event')
+  .action((file: string, opts: { brief?: boolean }) => {
     const vgDir = requireVibegitDir()
     const p = vgPaths(vgDir)
     const needle = normFile(file)
-    const entries = readIndex(p.index).filter(e => e.files.some(f => normFile(f) === needle))
+    let entries = readIndex(p.index).filter(e => e.files.some(f => normFile(f) === needle))
 
     if (entries.length === 0) {
-      console.log(`No sessions reference ${file}`)
+      if (!opts.brief) console.log(`No sessions reference ${file}`)
       return
+    }
+
+    if (opts.brief) {
+      entries = entries
+        .sort((a, b) => (b.started_at > a.started_at ? 1 : -1))
+        .slice(0, 3)
     }
 
     let totalEvents = 0
@@ -543,28 +551,41 @@ program
       if (events.length === 0) continue
 
       totalEvents += events.length
-      const date = entry.started_at.slice(0, 10)
-      console.log(`\n── ${date} ${entry.session_id}`)
-      console.log(`   intent: ${entry.intent} (${entry.outcome})`)
 
-      for (const e of events) {
-        const ts = e.at.slice(11, 16)
-        const body = (e as any).body ?? ''
-        console.log(`   [${ts}] ${e.type.toUpperCase().padEnd(11)} ${body}`)
-        if (e.type === 'decision' && e.alternatives.length > 0) {
-          for (const alt of e.alternatives) {
-            console.log(`            ✗ ${alt.option}: ${alt.reason_rejected}`)
-          }
+      if (opts.brief) {
+        const date = entry.started_at.slice(0, 10)
+        console.log(`[${date}] ${entry.intent} (${entry.outcome})`)
+        for (const e of events) {
+          const body = (e as any).body ?? ''
+          const prefix = e.type === 'decision' ? 'decided' :
+                         e.type === 'attempt' ? `tried (${(e as any).outcome})` :
+                         e.type === 'uncertainty' ? 'uncertain' : 'note'
+          console.log(`  ${prefix}: ${body}`)
         }
-        if (e.type === 'attempt') {
-          const reason = e.reason ? ` — ${e.reason}` : ''
-          console.log(`            outcome: ${e.outcome}${reason}`)
+      } else {
+        const date = entry.started_at.slice(0, 10)
+        console.log(`\n── ${date} ${entry.session_id}`)
+        console.log(`   intent: ${entry.intent} (${entry.outcome})`)
+
+        for (const e of events) {
+          const ts = e.at.slice(11, 16)
+          const body = (e as any).body ?? ''
+          console.log(`   [${ts}] ${e.type.toUpperCase().padEnd(11)} ${body}`)
+          if (e.type === 'decision' && e.alternatives.length > 0) {
+            for (const alt of e.alternatives) {
+              console.log(`            ✗ ${alt.option}: ${alt.reason_rejected}`)
+            }
+          }
+          if (e.type === 'attempt') {
+            const reason = e.reason ? ` — ${e.reason}` : ''
+            console.log(`            outcome: ${e.outcome}${reason}`)
+          }
         }
       }
     }
 
     if (totalEvents === 0) {
-      console.log(`No events reference ${file}`)
+      if (!opts.brief) console.log(`No events reference ${file}`)
     }
   })
 
@@ -890,7 +911,7 @@ const POST_COMMIT_SCRIPT = [
   'if command -v cogitlog >/dev/null 2>&1; then',
   '  COMMIT=$(git rev-parse HEAD 2>/dev/null)',
   '  SUBJECT=$(git log -1 --format=%s 2>/dev/null)',
-  '  cogitlog close --outcome completed --note "Committed: $SUBJECT ($COMMIT)" 2>/dev/null || true',
+  '  cogitlog close --outcome completed --note "Committed: $SUBJECT ($COMMIT)" || true',
   'fi',
 ].join('\n')
 
@@ -932,6 +953,268 @@ hookCmd
     const filtered = content.split('\n').filter(line => !cogitlogLines.has(line)).join('\n')
     fs.writeFileSync(hookFile, filtered, 'utf8')
     console.log('Removed cogitlog hook')
+  })
+
+// ── agent hooks (Claude Code integration) ────────────────────────────────────
+
+function readStdin(timeoutMs = 3000): Promise<string> {
+  return new Promise(resolve => {
+    if (process.stdin.isTTY) { resolve(''); return }
+    let data = ''
+    let resolved = false
+    const done = (val: string) => { if (!resolved) { resolved = true; resolve(val) } }
+    process.stdin.setEncoding('utf8')
+    process.stdin.on('data', chunk => {
+      data += chunk
+      if (data.length > 1_000_000) done(data) // 1MB safety cap
+    })
+    process.stdin.on('end', () => done(data))
+    setTimeout(() => done(data), timeoutMs)
+  })
+}
+
+hookCmd
+  .command('agent-init')
+  .description('SessionStart handler — outputs status + recent sessions for agent context')
+  .action(() => {
+    const vgDir = findVibegitDir()
+    if (!vgDir) return // silently skip if no cogitlog
+
+    const p = vgPaths(vgDir)
+    resolveInterrupted(vgDir)
+
+    const entries = readIndex(p.index)
+      .sort((a, b) => (b.started_at > a.started_at ? 1 : -1))
+      .slice(0, 5)
+
+    if (entries.length === 0) return
+
+    console.log('[cogitlog] Recent agent sessions:')
+    for (const e of entries) {
+      const date = e.started_at.slice(0, 10)
+      console.log(`  ${date}  ${e.outcome.padEnd(13)}  ${e.intent}`)
+    }
+
+    const activeId = getCurrentId(p.current)
+    if (activeId) {
+      const events = readEvents(p.session(activeId))
+      const begin = events.find(e => e.type === 'begin') as any
+      console.log(`[cogitlog] Active session: ${begin?.intent ?? activeId}`)
+    }
+  })
+
+hookCmd
+  .command('agent-pre-tool')
+  .description('PreToolUse handler — injects file context when agent reads/edits a file')
+  .action(async () => {
+    const vgDir = findVibegitDir()
+    if (!vgDir) return
+
+    const raw = await readStdin()
+    if (!raw) return
+
+    let input: any
+    try { input = JSON.parse(raw) } catch { return }
+
+    const filePath = input?.tool_input?.file_path
+    if (!filePath) return
+
+    const p = vgPaths(vgDir)
+    const needle = normFile(filePath)
+    const entries = readIndex(p.index)
+      .filter(e => e.files.some(f => normFile(f) === needle))
+      .sort((a, b) => (b.started_at > a.started_at ? 1 : -1))
+      .slice(0, 3)
+
+    if (entries.length === 0) return
+
+    const lines: string[] = [`[cogitlog] Past reasoning for ${path.basename(filePath)}:`]
+    for (const entry of entries) {
+      const sessionFile = p.session(entry.session_id)
+      if (!fs.existsSync(sessionFile)) continue
+      const events = readEvents(sessionFile).filter(e =>
+        'files' in e && e.files.some(f => normFile(f.path) === needle),
+      )
+      if (events.length === 0) continue
+
+      const date = entry.started_at.slice(0, 10)
+      lines.push(`  [${date}] ${entry.intent} (${entry.outcome})`)
+      for (const e of events) {
+        const body = (e as any).body ?? ''
+        const prefix = e.type === 'decision' ? 'decided' :
+                       e.type === 'attempt' ? `tried (${(e as any).outcome})` :
+                       e.type === 'uncertainty' ? 'uncertain' : 'note'
+        lines.push(`    ${prefix}: ${body}`)
+      }
+    }
+
+    if (lines.length > 1) {
+      console.log(lines.join('\n'))
+    }
+  })
+
+hookCmd
+  .command('agent-begin')
+  .description('UserPromptSubmit handler — auto-begins a session from the first user prompt')
+  .action(async () => {
+    const vgDir = findVibegitDir()
+    if (!vgDir) return
+
+    const p = vgPaths(vgDir)
+
+    // Read stdin before acquiring lock (I/O can be slow)
+    const raw = await readStdin()
+    if (!raw) return
+
+    let input: any
+    try { input = JSON.parse(raw) } catch { return }
+
+    const userMessage = input?.message ?? input?.content ?? ''
+    const intent = typeof userMessage === 'string' && userMessage.length > 0
+      ? userMessage.slice(0, 120)
+      : 'Auto-session'
+
+    // Atomic check-and-create under lock to prevent race conditions
+    await withLock(p.lock, async () => {
+      resolveInterrupted(vgDir)
+      const activeId = getCurrentId(p.current)
+      if (activeId) return
+
+      const sessionId = makeSessionId()
+      const gitRoot = getGitRoot()
+      const gitHead = getHead(gitRoot ?? undefined)
+
+      const event: SessionEvent = {
+        session_id: sessionId,
+        seq: 0,
+        type: 'begin',
+        at: now(),
+        intent,
+        context: 'Auto-started by agent hook',
+        git_head: gitHead,
+        resumed_from: null,
+      }
+      appendEvent(p.session(sessionId), event)
+
+      // setCurrentId/appendIndex acquire their own lock, but we already hold it.
+      // Write directly to avoid deadlock.
+      fs.writeFileSync(p.current, sessionId)
+      fs.appendFileSync(p.index, JSON.stringify({
+        session_id: sessionId,
+        index_version: 1,
+        started_at: event.at,
+        closed_at: null,
+        agent: { tool: AGENT_TOOL, model: null },
+        git_head: gitHead,
+        intent,
+        outcome: 'in_progress',
+        outcome_note: null,
+        files: [],
+        tags: ['auto'],
+      } satisfies IndexEntry) + '\n')
+
+      console.log(`[cogitlog] Session started: ${intent.slice(0, 80)}`)
+    })
+  })
+
+hookCmd
+  .command('install-agent')
+  .description('Install Claude Code hooks for automatic cogitlog integration')
+  .action(() => {
+    const projectRoot = getGitRoot() ?? process.cwd()
+    const claudeDir = path.join(projectRoot, '.claude')
+    const settingsFile = path.join(claudeDir, 'settings.json')
+
+    let settings: any = {}
+    if (fs.existsSync(settingsFile)) {
+      try {
+        settings = JSON.parse(fs.readFileSync(settingsFile, 'utf8'))
+      } catch {
+        console.error(`Error: ${settingsFile} contains invalid JSON. Fix it manually before running install-agent.`)
+        process.exit(1)
+      }
+    } else {
+      fs.mkdirSync(claudeDir, { recursive: true })
+    }
+
+    if (!settings.hooks) settings.hooks = {}
+
+    // SessionStart — show recent sessions
+    if (!settings.hooks.SessionStart) settings.hooks.SessionStart = []
+    const hasInit = settings.hooks.SessionStart.some((r: any) =>
+      r.hooks?.some((h: any) => h.command?.includes('cogitlog hook agent-init')))
+    if (!hasInit) {
+      settings.hooks.SessionStart.push({
+        matcher: '',
+        hooks: [{ type: 'command', command: 'cogitlog hook agent-init || true' }],
+      })
+      console.log('  Added SessionStart hook (recent sessions)')
+    }
+
+    // PreToolUse — inject file context on Read/Edit
+    if (!settings.hooks.PreToolUse) settings.hooks.PreToolUse = []
+    const hasPreTool = settings.hooks.PreToolUse.some((r: any) =>
+      r.hooks?.some((h: any) => h.command?.includes('cogitlog hook agent-pre-tool')))
+    if (!hasPreTool) {
+      settings.hooks.PreToolUse.push({
+        matcher: 'Read|Edit',
+        hooks: [{ type: 'command', command: 'cogitlog hook agent-pre-tool || true' }],
+      })
+      console.log('  Added PreToolUse hook (file context on Read/Edit)')
+    }
+
+    // UserPromptSubmit — auto-begin session
+    if (!settings.hooks.UserPromptSubmit) settings.hooks.UserPromptSubmit = []
+    const hasBegin = settings.hooks.UserPromptSubmit.some((r: any) =>
+      r.hooks?.some((h: any) => h.command?.includes('cogitlog hook agent-begin')))
+    if (!hasBegin) {
+      settings.hooks.UserPromptSubmit.push({
+        matcher: '',
+        hooks: [{ type: 'command', command: 'cogitlog hook agent-begin || true' }],
+      })
+      console.log('  Added UserPromptSubmit hook (auto-begin session)')
+    }
+
+    fs.writeFileSync(settingsFile, JSON.stringify(settings, null, 2) + '\n')
+    console.log(`\nHooks written to ${path.relative(process.cwd(), settingsFile)}`)
+    console.log('Commit .claude/settings.json to share with your team.')
+  })
+
+hookCmd
+  .command('uninstall-agent')
+  .description('Remove Claude Code hooks for cogitlog')
+  .action(() => {
+    const projectRoot = getGitRoot() ?? process.cwd()
+    const settingsFile = path.join(projectRoot, '.claude', 'settings.json')
+
+    if (!fs.existsSync(settingsFile)) {
+      console.log('No .claude/settings.json found')
+      return
+    }
+
+    let settings: any
+    try { settings = JSON.parse(fs.readFileSync(settingsFile, 'utf8')) } catch { return }
+
+    if (!settings.hooks) { console.log('No hooks found'); return }
+
+    let removed = 0
+    for (const event of Object.keys(settings.hooks)) {
+      const rules = settings.hooks[event]
+      if (!Array.isArray(rules)) continue
+      const filtered = rules.filter((r: any) =>
+        !r.hooks?.some((h: any) => h.command?.includes('cogitlog hook agent-')))
+      removed += rules.length - filtered.length
+      if (filtered.length === 0) {
+        delete settings.hooks[event]
+      } else {
+        settings.hooks[event] = filtered
+      }
+    }
+
+    if (Object.keys(settings.hooks).length === 0) delete settings.hooks
+
+    fs.writeFileSync(settingsFile, JSON.stringify(settings, null, 2) + '\n')
+    console.log(`Removed ${removed} cogitlog hook(s)`)
   })
 
 // ─────────────────────────────────────────────────────────────────────────────

@@ -1217,6 +1217,156 @@ hookCmd
     console.log(`Removed ${removed} cogitlog hook(s)`)
   })
 
+// ── install-skills ───────────────────────────────────────────────────────────
+
+const SKILL_READ = `---
+description: Check cogitlog history before working on a file or topic. Usage: /cogitlog-read <file-or-topic> (e.g. /cogitlog-read src/cli.ts, /cogitlog-read "auth flow")
+---
+
+## User Input
+
+\`\`\`text
+$ARGUMENTS
+\`\`\`
+
+Parse the argument to determine if it's a **file path** or a **topic/keyword**.
+
+- If it looks like a file path (contains \`/\` or \`.\`): treat as a file
+- Otherwise: treat as a topic
+
+## If File Path
+
+Run these cogitlog queries in parallel:
+
+1. **\`cogitlog_why\`** on the file — to see past decisions that affected it
+2. **\`cogitlog_context\`** on the file with \`brief: true\` — to see all reasoning events
+
+## If Topic
+
+Run this cogitlog query:
+
+1. **\`cogitlog_query\`** with \`deep: true\` — to search sessions by topic, including event bodies
+
+## Also Run
+
+- **\`cogitlog_log\`** with \`limit: 5\` — to show recent sessions for general awareness
+
+## Output
+
+Summarize what you found in a concise format:
+
+### Cogitlog Context: {file or topic}
+
+**Recent decisions:**
+- (list decisions with session IDs and dates)
+
+**Key notes/events:**
+- (list relevant notes, attempts, uncertainties)
+
+**Active session:**
+- Whether there's a currently open session (from \`cogitlog_status\`)
+
+If nothing was found, say so clearly: "No prior cogitlog history found for {target}."
+
+## Operating Principles
+
+- This is **read-only** — no sessions are opened, no events are recorded
+- Always run this before modifying files that have been touched in prior sessions
+- Surface surprises: if a past decision contradicts the current plan, flag it prominently
+`
+
+const SKILL_WRITE = `---
+description: Open a cogitlog session for the current task. Usage: /cogitlog-write <intent> (e.g. /cogitlog-write "fix redirect loop in auth middleware")
+---
+
+## User Input
+
+\`\`\`text
+$ARGUMENTS
+\`\`\`
+
+The argument is the **intent** — what you're about to do.
+
+## Step 1: Check Current Status
+
+Run **\`cogitlog_status\`** to see if there's already an open session.
+
+- If there's an open session that matches the current intent, **do not open a new one**. Tell the user the session is already open and continue.
+- If there's an open session for a *different* task, it will be auto-closed as \`interrupted\` when you open the new one. Warn the user about this before proceeding.
+
+## Step 2: Open the Session
+
+Run **\`cogitlog_begin\`** with:
+- \`intent\`: the user's argument
+- \`tags\`: infer 1-3 relevant tags from the intent (e.g., \`["bugfix", "auth"]\`, \`["feature", "cli"]\`)
+
+## Step 3: Confirm and Remind
+
+Tell the user:
+
+> Session opened: "{intent}"
+>
+> During this task, I will log events using:
+> - \`cogitlog_decision\` — when making important choices
+> - \`cogitlog_note\` — when discovering something relevant
+> - \`cogitlog_attempt\` — when trying a solution (with outcome)
+> - \`cogitlog_uncertainty\` — when something is unclear
+>
+> When done, I'll close with \`cogitlog_close\`.
+
+## IMPORTANT — Ongoing Behavior
+
+After opening the session, you MUST continue logging events throughout the rest of the conversation:
+
+- **Before modifying a file**: run \`cogitlog_why\` on it first
+- **When you make a non-obvious choice**: log a \`cogitlog_decision\` with alternatives considered
+- **When you try something**: log a \`cogitlog_attempt\` with the outcome
+- **When you discover something unexpected**: log a \`cogitlog_note\`
+- **When you're unsure about something**: log a \`cogitlog_uncertainty\`
+- **When the task is done**: run \`cogitlog_close\` with the appropriate outcome
+
+Do NOT forget to close the session. If the user moves on to a different topic without explicitly closing, close the session as \`completed\` or \`partial\` based on what was accomplished.
+`
+
+program
+  .command('install-skills')
+  .description('Install Claude Code slash-command skills (/cogitlog-read, /cogitlog-write) to ~/.claude/commands/')
+  .option('--force', 'Overwrite existing skill files')
+  .option('--dir <path>', 'Custom output directory (default: ~/.claude/commands)')
+  .action((opts: { force?: boolean; dir?: string }) => {
+    const targetDir = opts.dir ?? path.join(process.env.HOME ?? '~', '.claude', 'commands')
+
+    if (!fs.existsSync(targetDir)) {
+      fs.mkdirSync(targetDir, { recursive: true })
+    }
+
+    const skills: { name: string; content: string }[] = [
+      { name: 'cogitlog-read.md', content: SKILL_READ },
+      { name: 'cogitlog-write.md', content: SKILL_WRITE },
+    ]
+
+    let installed = 0
+    let skipped = 0
+
+    for (const skill of skills) {
+      const filePath = path.join(targetDir, skill.name)
+      if (fs.existsSync(filePath) && !opts.force) {
+        console.log(`  Skipped ${skill.name} (already exists, use --force to overwrite)`)
+        skipped++
+        continue
+      }
+      fs.writeFileSync(filePath, skill.content)
+      console.log(`  Installed ${skill.name}`)
+      installed++
+    }
+
+    console.log(`\n${installed} skill(s) installed to ${targetDir}`)
+    if (skipped > 0) console.log(`${skipped} skill(s) skipped (use --force to overwrite)`)
+    console.log('\nUsage:')
+    console.log('  /cogitlog-read <file-or-topic>   Check history before working')
+    console.log('  /cogitlog-write <intent>          Open a session for current task')
+  })
+
 // ─────────────────────────────────────────────────────────────────────────────
 
 program.parse()

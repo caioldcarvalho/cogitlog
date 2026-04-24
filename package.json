@@ -1,6 +1,6 @@
 {
   "name": "cogitlog",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "Semantic memory protocol for AI agents working in codebases",
   "bin": {
     "cogitlog": "dist/cli.js"

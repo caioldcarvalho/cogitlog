@@ -9,15 +9,21 @@ import { AGENT_TOOL, SPEC_VERSION, findVibegitDir, requireVibegitDir, vgPaths } 
 import {
   appendEvent,
   appendIndex,
+  buildEntriesFromSessions,
+  checkIndexHealth,
   clearCurrentId,
+  describeEvent,
+  deriveDigest,
   deriveFiles,
+  deriveLinks,
   getCurrentId,
   nextSeq,
+  parseInlineLinks,
   readEvents,
   readIndex,
+  rebuildIndex,
   resolveInterrupted,
   setCurrentId,
-  writeIndex,
 } from './io'
 import { autoFileRefs, getGitRoot, getHead, resolveFileRefs } from './git'
 import type { AttemptOutcome, FileRef, IndexEntry, SessionEvent, SessionOutcome } from './types'
@@ -55,6 +61,69 @@ function fileRefs(explicitFiles: string[], gitRoot: string | null): FileRef[] {
   return autoFileRefs(gitRoot)
 }
 
+/**
+ * The one-line description stored on an event.
+ *
+ * Null when the body already is its own summary — readers fall back to the first
+ * line of the body, so there is nothing to gain from duplicating it on disk.
+ */
+function descriptionFor(explicit: string | undefined, body: string): string | null {
+  if (explicit?.trim()) return explicit.trim()
+  const lines = body.trim().split('\n')
+  if (lines.length > 1 && lines[0].trim()) return lines[0].trim()
+  return null
+}
+
+/** `--relates-to` values plus any `[[session-id]]` written inline in the body. */
+function linksFor(explicit: string[], body: string): string[] {
+  return Array.from(new Set([...explicit, ...parseInlineLinks(body)]))
+}
+
+/**
+ * Read the index, healing or reporting first.
+ *
+ * A store whose index is missing is rebuilt in place: the session files are the
+ * source of truth and there is nothing in an absent index to lose. A stale index
+ * is only reported — rebuilding it silently could drop tags that only exist there.
+ */
+function loadIndex(vgDir: string): IndexEntry[] {
+  const p = vgPaths(vgDir)
+  const health = checkIndexHealth(vgDir)
+
+  if (health.state === 'missing') {
+    // Healing writes to disk from what is otherwise a read command. A store on a
+    // read-only mount, or one owned by another user, must still be readable — so
+    // fall back to the in-memory rebuild rather than failing the command.
+    try {
+      const entries = rebuildIndex(vgDir)
+      console.error(`note: index was missing — rebuilt from ${entries.length} session file(s)`)
+      if (!fs.existsSync(p.config)) {
+        fs.writeFileSync(
+          p.config,
+          JSON.stringify({ spec_version: SPEC_VERSION, created_at: now() }, null, 2) + '\n',
+        )
+      }
+      return entries
+    } catch (err) {
+      const entries = buildEntriesFromSessions(vgDir)
+      console.error(
+        `warning: ${entries.length} session file(s) found but the index is missing and could not be ` +
+        `rebuilt (${(err as Error).message}) — reading from the session files directly`,
+      )
+      return entries
+    }
+  }
+
+  if (health.state === 'stale') {
+    console.error(
+      `warning: ${health.sessions} session file(s) on disk but only ${health.indexed} in the index — ` +
+      `run \`cogitlog repair\` to see all of them`,
+    )
+  }
+
+  return readIndex(p.index)
+}
+
 async function promptOutcome(): Promise<SessionOutcome> {
   if (!process.stdin.isTTY) {
     console.error('--outcome is required in non-interactive mode')
@@ -81,7 +150,7 @@ const program = new Command()
 program
   .name('cogitlog')
   .description('Semantic memory protocol for AI agents working in codebases')
-  .version('0.1.0')
+  .version('0.7.0')
 
 // ── init ─────────────────────────────────────────────────────────────────────
 
@@ -97,109 +166,212 @@ const AGENT_INSTRUCTION_FILES = [
   '.github/copilot-instructions.md',
 ]
 
+const HINT_BEGIN = '<!-- cogitlog:begin -->'
+const HINT_END = '<!-- cogitlog:end -->'
+
 const COGITLOG_HINT = `
+${HINT_BEGIN}
 ## cogitlog
 
-This project uses [cogitlog](https://github.com/caiocarvalho/cogitlog) to log AI agent sessions.
+This repository records **why** its changes were made — decisions, the alternatives that
+were rejected, and the attempts that failed — in \`.cogitlog/\`.
+
+### Read it before you edit
+
+If a piece of code looks arbitrary, assume it isn't: someone may have already tried the
+obvious thing and logged why it failed. Check before rewriting it.
+
+  cogitlog why <file>              # decisions that touched this file
+  cogitlog query "<topic>"         # full-text search across every session
+  cogitlog log                     # recent sessions, newest first
+  cogitlog log -d                  # ...with a one-line description per event
+  cogitlog show <session-id>       # one session in full
+
+**Nothing installed?** Either \`npm i -g cogitlog\` and use the commands above, or read the
+store directly — \`.cogitlog/sessions/*.jsonl\` is plain JSONL, one event per line, one file
+per session, human-readable with no tooling at all.
+
+### Write it as you work
 
 At the start of every task, open a session:
+
   cogitlog begin "<what you intend to do>"
 
-Record meaningful events during the task:
-  cogitlog note / decision / attempt / uncertainty
+Record events when they happen:
+  - After choosing between alternatives: \`cogitlog decision "<what and why>" -a "rejected:reason"\`
+  - After a fix or implementation attempt: \`cogitlog attempt "<what you tried>" [succeeded|failed|partial]\`
+  - When you notice something worth remembering: \`cogitlog note "<observation>"\`
+  - Before closing, if any choice was borderline: \`cogitlog uncertainty "<the doubt>"\`
+
+A failed attempt is worth more than a successful one — it is what stops the next person
+from walking back into the same dead end.
 
 At the end, close the session:
+
   cogitlog close --outcome <completed|partial|abandoned|interrupted>
 
 Run \`cogitlog onboard\` for full instructions.
+${HINT_END}
 `
 
-function appendCogitlogHint(filePath: string): void {
+/** Matches a legacy (pre-marker) `## cogitlog` section, up to the next heading or EOF. */
+const LEGACY_HINT_RE = /(?:^|\n)#{1,6} cogitlog\b[\s\S]*?(?=\n#{1,6} |\n*$)/
+
+type UpsertResult =
+  | 'replaced'   // a managed or legacy block was rewritten
+  | 'appended'   // no block existed, one was added
+  | 'unchanged'  // the managed block is already current
+  | 'skipped'    // the file mentions cogitlog outside any block we manage
+
+/**
+ * Put the current hint block into an agent instruction file.
+ *
+ * Repos initialized by an older version carry an outdated block, so a plain
+ * "already mentions cogitlog → skip" check would freeze them on the version that
+ * never explained how to *read* the store. Marked blocks and legacy `## cogitlog`
+ * sections are therefore replaced in place; a file that mentions cogitlog in some
+ * other hand-written way is left alone unless forced.
+ */
+function upsertCogitlogHint(filePath: string, force = false): UpsertResult {
   const content = fs.readFileSync(filePath, 'utf8')
-  if (content.includes('cogitlog')) return // already mentioned
-  fs.appendFileSync(filePath, COGITLOG_HINT)
-  console.log(`  Appended cogitlog reminder → ${path.relative(process.cwd(), filePath)}`)
+
+  const start = content.indexOf(HINT_BEGIN)
+  const end = content.indexOf(HINT_END)
+  if (start !== -1 && end > start) {
+    const updated = content.slice(0, start) + COGITLOG_HINT.trim() + content.slice(end + HINT_END.length)
+    if (updated === content) return 'unchanged'
+    fs.writeFileSync(filePath, updated, 'utf8')
+    return 'replaced'
+  }
+
+  if (LEGACY_HINT_RE.test(content)) {
+    fs.writeFileSync(filePath, content.replace(LEGACY_HINT_RE, '\n' + COGITLOG_HINT.trim() + '\n'), 'utf8')
+    return 'replaced'
+  }
+
+  if (content.includes('cogitlog') && !force) return 'skipped'
+
+  fs.appendFileSync(filePath, content.endsWith('\n') ? COGITLOG_HINT : '\n' + COGITLOG_HINT)
+  return 'appended'
+}
+
+const COGITLOG_ROOT_FILE = `This project uses cogitlog to record why its changes were made —
+decisions, rejected alternatives, and failed attempts.
+
+Read the log before changing code that looks arbitrary:
+
+  npm i -g cogitlog
+  cogitlog why <file>          # decisions that touched a file
+  cogitlog query "<topic>"     # search every session
+  cogitlog log                 # recent sessions
+
+Or read it without installing anything: .cogitlog/sessions/*.jsonl is plain
+JSONL, one event per line.
+
+Run \`cogitlog onboard\` for the full protocol.
+`
+
+/** Write/refresh the hint into every agent instruction file that exists. Returns a per-file result. */
+function syncInstructionFiles(projectRoot: string, force = false): Array<[string, UpsertResult]> {
+  const results: Array<[string, UpsertResult]> = []
+  for (const rel of AGENT_INSTRUCTION_FILES) {
+    const filePath = path.join(projectRoot, rel)
+    if (!fs.existsSync(filePath)) continue
+    results.push([rel, upsertCogitlogHint(filePath, force)])
+  }
+  return results
+}
+
+function reportInstructionSync(results: Array<[string, UpsertResult]>): void {
+  for (const [rel, result] of results) {
+    if (result === 'replaced') console.log(`  Updated cogitlog block → ${rel}`)
+    else if (result === 'appended') console.log(`  Appended cogitlog block → ${rel}`)
+    else if (result === 'unchanged') console.log(`  Already up to date → ${rel}`)
+    else console.log(`  Skipped ${rel} (mentions cogitlog outside a managed block)`)
+  }
 }
 
 program
   .command('init')
-  .description('Initialize .cogitlog/ in the current directory')
+  .description('Initialize .cogitlog/ in the current directory (safe to re-run: repairs and refreshes)')
   .action(() => {
-    const vgDir = path.join(process.cwd(), '.cogitlog')
-    if (fs.existsSync(vgDir)) {
-      console.log('.cogitlog/ already exists')
-      return
+    const existing = findVibegitDir(process.cwd())
+    const vgDir = existing ?? path.join(process.cwd(), '.cogitlog')
+    const p = vgPaths(vgDir)
+
+    if (existing) {
+      console.log(`.cogitlog/ already exists at ${path.relative(process.cwd(), existing) || '.'}`)
+      // An old store may be missing the scaffolding entirely — fill it in rather
+      // than leaving the repo answering "No sessions" forever.
+      fs.mkdirSync(p.sessions, { recursive: true })
+      if (!fs.existsSync(p.config)) {
+        fs.writeFileSync(
+          p.config,
+          JSON.stringify({ spec_version: SPEC_VERSION, created_at: now() }, null, 2) + '\n',
+        )
+        console.log('  Created missing config.json')
+      }
+      const health = checkIndexHealth(vgDir)
+      if (health.state === 'missing') {
+        const entries = rebuildIndex(vgDir)
+        console.log(`  Index was missing — rebuilt from ${entries.length} session file(s)`)
+      } else if (health.state === 'stale') {
+        const entries = rebuildIndex(vgDir)
+        console.log(`  Index was incomplete — rebuilt ${entries.length} session(s)`)
+      } else if (!fs.existsSync(p.index)) {
+        fs.writeFileSync(p.index, '')
+      }
+    } else {
+      fs.mkdirSync(p.sessions, { recursive: true })
+      fs.writeFileSync(
+        p.config,
+        JSON.stringify({ spec_version: SPEC_VERSION, created_at: now() }, null, 2) + '\n',
+      )
+      fs.writeFileSync(p.index, '')
+      fs.writeFileSync(
+        path.join(vgDir, 'AGENTS.md'),
+        'This repo uses cogitlog to track AI agent sessions.\n' +
+        'Run `cogitlog onboard` for usage instructions.\n',
+      )
     }
-    fs.mkdirSync(path.join(vgDir, 'sessions'), { recursive: true })
-    fs.writeFileSync(
-      path.join(vgDir, 'config.json'),
-      JSON.stringify({ spec_version: SPEC_VERSION, created_at: now() }, null, 2) + '\n',
-    )
-    fs.writeFileSync(path.join(vgDir, 'index.jsonl'), '')
-    fs.writeFileSync(
-      path.join(vgDir, 'AGENTS.md'),
-      'This repo uses cogitlog to track AI agent sessions.\n' +
-      'Run `cogitlog onboard` for usage instructions.\n',
-    )
 
     // Root-level hint file — committed to source control so agents see it immediately
     const projectRoot = getGitRoot() ?? process.cwd()
     const hintFile = path.join(projectRoot, 'COGITLOG')
     if (!fs.existsSync(hintFile)) {
-      fs.writeFileSync(
-        hintFile,
-        'This project uses cogitlog to log AI agent sessions.\n' +
-        'Run `cogitlog onboard` to see what that means and how to use it.\n',
-      )
+      fs.writeFileSync(hintFile, COGITLOG_ROOT_FILE)
       console.log('Created COGITLOG (commit this file so agents can find it)')
     }
 
-    // Append cogitlog hint to any existing agent instruction files
-    const found: string[] = []
-    for (const rel of AGENT_INSTRUCTION_FILES) {
-      const filePath = path.join(projectRoot, rel)
-      if (fs.existsSync(filePath)) {
-        appendCogitlogHint(filePath)
-        found.push(rel)
-      }
-    }
-    if (found.length > 0) {
-      console.log(`Updated ${found.length} agent instruction file(s) with cogitlog reminder`)
-    }
+    const results = syncInstructionFiles(projectRoot)
+    reportInstructionSync(results)
+    const touched = results.filter(([, r]) => r === 'replaced' || r === 'appended').length
+    if (touched > 0) console.log(`Updated ${touched} agent instruction file(s)`)
 
-    console.log('Initialized .cogitlog/')
+    if (!existing) console.log('Initialized .cogitlog/')
   })
 
 // ── remindme ──────────────────────────────────────────────────────────────────
 
 program
   .command('remindme')
-  .description('Append cogitlog usage reminder to agent instruction files (CLAUDE.md, AGENTS.md, etc.)')
-  .action(() => {
+  .description('Write/refresh the cogitlog block in agent instruction files (CLAUDE.md, AGENTS.md, etc.)')
+  .option('--force', 'Append even to files that mention cogitlog outside a managed block')
+  .action((opts: { force?: boolean }) => {
     const projectRoot = getGitRoot() ?? process.cwd()
-    const found: string[] = []
-    const skipped: string[] = []
+    const results = syncInstructionFiles(projectRoot, opts.force)
 
-    for (const rel of AGENT_INSTRUCTION_FILES) {
-      const filePath = path.join(projectRoot, rel)
-      if (!fs.existsSync(filePath)) continue
-      const content = fs.readFileSync(filePath, 'utf8')
-      if (content.includes('cogitlog')) {
-        skipped.push(rel)
-      } else {
-        fs.appendFileSync(filePath, COGITLOG_HINT)
-        found.push(rel)
-        console.log(`  Appended reminder → ${rel}`)
-      }
-    }
-
-    if (found.length === 0 && skipped.length === 0) {
+    if (results.length === 0) {
       // No instruction files found — create CLAUDE.md
       const claudeMd = path.join(projectRoot, 'CLAUDE.md')
       fs.writeFileSync(claudeMd, COGITLOG_HINT.trimStart())
-      console.log('  Created CLAUDE.md with cogitlog reminder')
-    } else if (found.length === 0) {
-      console.log(`  Already present in: ${skipped.join(', ')}`)
+      console.log('  Created CLAUDE.md with the cogitlog block')
+      return
+    }
+
+    reportInstructionSync(results)
+    if (results.some(([, r]) => r === 'skipped')) {
+      console.log('  Use --force to append the block to skipped files anyway.')
     }
   })
 
@@ -218,10 +390,45 @@ program
 
     const existingId = getCurrentId(p.current)
     if (existingId) {
-      const events = readEvents(p.session(existingId))
-      if (!events.some(e => e.type === 'close')) {
-        console.error(`Session ${existingId} is already active. Close it first with \`cogitlog close\`.`)
-        process.exit(1)
+      const orphanEvents = readEvents(p.session(existingId))
+      if (!orphanEvents.some(e => e.type === 'close')) {
+        // Auto-close the orphan session instead of blocking
+        const orphanFile = p.session(existingId)
+        const closeEvent: SessionEvent = {
+          session_id: existingId,
+          seq: nextSeq(orphanFile),
+          type: 'close',
+          at: now(),
+          outcome: 'interrupted',
+          outcome_note: 'auto-closed: new session started',
+          files: autoFileRefs(getGitRoot()),
+        }
+        appendEvent(orphanFile, closeEvent)
+
+        const allOrphanEvents = readEvents(orphanFile)
+        const orphanBegin = allOrphanEvents.find(e => e.type === 'begin') as any
+        const existingEntries = readIndex(p.index)
+        const existingEntry = existingEntries.find(e => e.session_id === existingId)
+
+        const closedEntry: IndexEntry = {
+          session_id: existingId,
+          index_version: (existingEntry?.index_version ?? 1) + 1,
+          started_at: orphanBegin?.at ?? closeEvent.at,
+          closed_at: closeEvent.at,
+          agent: { tool: AGENT_TOOL, model: null },
+          git_head: orphanBegin?.git_head ?? null,
+          intent: orphanBegin?.intent ?? '',
+          outcome: 'interrupted',
+          outcome_note: 'auto-closed: new session started',
+          files: deriveFiles(allOrphanEvents),
+          tags: existingEntry?.tags ?? [],
+          digest: deriveDigest(allOrphanEvents),
+          links: deriveLinks(allOrphanEvents),
+        }
+        await appendIndex(p.index, p.lock, closedEntry)
+        await clearCurrentId(p.current, p.lock)
+
+        console.error(`warning: auto-closed orphan session ${existingId} (interrupted)`)
       }
     }
 
@@ -254,6 +461,8 @@ program
       outcome_note: null,
       files: [],
       tags: opts.tag,
+      digest: [],
+      links: opts.resume ? [opts.resume] : [],
     }
     await appendIndex(p.index, p.lock, entry)
 
@@ -266,7 +475,9 @@ program
   .command('note <text>')
   .description('Add a note to the current session')
   .option('-f, --file <path>', 'File reference — repeatable (default: auto-detect from git)', collect, [] as string[])
-  .action(async (text: string, opts: { file: string[] }) => {
+  .option('-d, --description <text>', 'One-line summary (default: first line of the body)')
+  .option('--relates-to <session-id>', 'Session this refers to — repeatable', collect, [] as string[])
+  .action(async (text: string, opts: { file: string[]; description?: string; relatesTo: string[] }) => {
     const vgDir = requireVibegitDir()
     const p = vgPaths(vgDir)
     const sessionId = requireActiveSession(vgDir)
@@ -277,6 +488,8 @@ program
       type: 'note',
       at: now(),
       body: text,
+      description: descriptionFor(opts.description, text),
+      links: linksFor(opts.relatesTo, text),
       files: fileRefs(opts.file, getGitRoot()),
     }
     appendEvent(p.session(sessionId), event)
@@ -295,7 +508,9 @@ program
     collect,
     [] as string[],
   )
-  .action(async (text: string, opts: { file: string[]; alternative: string[] }) => {
+  .option('-d, --description <text>', 'One-line summary (default: first line of the body)')
+  .option('--relates-to <session-id>', 'Session this supersedes or builds on — repeatable', collect, [] as string[])
+  .action(async (text: string, opts: { file: string[]; alternative: string[]; description?: string; relatesTo: string[] }) => {
     const vgDir = requireVibegitDir()
     const p = vgPaths(vgDir)
     const sessionId = requireActiveSession(vgDir)
@@ -315,6 +530,8 @@ program
       type: 'decision',
       at: now(),
       body: text,
+      description: descriptionFor(opts.description, text),
+      links: linksFor(opts.relatesTo, text),
       alternatives,
       files: fileRefs(opts.file, getGitRoot()),
     }
@@ -325,15 +542,18 @@ program
 // ── attempt ───────────────────────────────────────────────────────────────────
 
 program
-  .command('attempt <text>')
-  .description('Record an attempt')
-  .requiredOption('--outcome <outcome>', 'succeeded | failed | partial')
+  .command('attempt <text> [outcome]')
+  .description('Record an attempt (outcome defaults to "succeeded")')
+  .option('--outcome <outcome>', 'succeeded | failed | partial')
   .option('--reason <text>', 'Why it failed or was partial')
   .option('-f, --file <path>', 'File reference — repeatable', collect, [] as string[])
-  .action(async (text: string, opts: { outcome: string; reason?: string; file: string[] }) => {
+  .option('-d, --description <text>', 'One-line summary (default: first line of the body)')
+  .option('--relates-to <session-id>', 'Session this refers to — repeatable', collect, [] as string[])
+  .action(async (text: string, positionalOutcome: string | undefined, opts: { outcome?: string; reason?: string; file: string[]; description?: string; relatesTo: string[] }) => {
     const valid: AttemptOutcome[] = ['succeeded', 'failed', 'partial']
-    if (!valid.includes(opts.outcome as AttemptOutcome)) {
-      console.error(`--outcome must be one of: ${valid.join(', ')}`)
+    const rawOutcome = opts.outcome ?? positionalOutcome ?? 'succeeded'
+    if (!valid.includes(rawOutcome as AttemptOutcome)) {
+      console.error(`outcome must be one of: ${valid.join(', ')}`)
       process.exit(1)
     }
     const vgDir = requireVibegitDir()
@@ -346,7 +566,9 @@ program
       type: 'attempt',
       at: now(),
       body: text,
-      outcome: opts.outcome as AttemptOutcome,
+      description: descriptionFor(opts.description, text),
+      links: linksFor(opts.relatesTo, text),
+      outcome: rawOutcome as AttemptOutcome,
       reason: opts.reason ?? null,
       files: fileRefs(opts.file, getGitRoot()),
     }
@@ -360,7 +582,9 @@ program
   .command('uncertainty <text>')
   .description('Flag an uncertainty')
   .option('-f, --file <path>', 'File reference — repeatable', collect, [] as string[])
-  .action(async (text: string, opts: { file: string[] }) => {
+  .option('-d, --description <text>', 'One-line summary (default: first line of the body)')
+  .option('--relates-to <session-id>', 'Session this refers to — repeatable', collect, [] as string[])
+  .action(async (text: string, opts: { file: string[]; description?: string; relatesTo: string[] }) => {
     const vgDir = requireVibegitDir()
     const p = vgPaths(vgDir)
     const sessionId = requireActiveSession(vgDir)
@@ -371,6 +595,8 @@ program
       type: 'uncertainty',
       at: now(),
       body: text,
+      description: descriptionFor(opts.description, text),
+      links: linksFor(opts.relatesTo, text),
       files: fileRefs(opts.file, getGitRoot()),
     }
     appendEvent(p.session(sessionId), event)
@@ -417,6 +643,11 @@ program
     appendEvent(sessionFile, event)
 
     const allEvents = readEvents(sessionFile)
+
+    if (!allEvents.some(e => e.type === 'uncertainty')) {
+      console.error('hint: no uncertainties were logged this session')
+    }
+
     const begin = allEvents.find(e => e.type === 'begin') as any
 
     // Merge tags from begin index entry (if any) with tags passed to close
@@ -426,7 +657,7 @@ program
 
     const entry: IndexEntry = {
       session_id: sessionId,
-      index_version: 2,
+      index_version: (existingEntry?.index_version ?? 1) + 1,
       started_at: begin?.at ?? event.at,
       closed_at: event.at,
       agent: { tool: AGENT_TOOL, model: null },
@@ -436,6 +667,8 @@ program
       outcome_note: opts.note ?? null,
       files: deriveFiles(allEvents),
       tags: mergedTags,
+      digest: deriveDigest(allEvents),
+      links: deriveLinks(allEvents),
     }
     await appendIndex(p.index, p.lock, entry)
     await clearCurrentId(p.current, p.lock)
@@ -452,10 +685,11 @@ program
   .action((file: string, opts: { mentions?: boolean }) => {
     const vgDir = requireVibegitDir()
     const p = vgPaths(vgDir)
-    const entries = readIndex(p.index).filter(e => e.files.includes(file))
+    const entries = loadIndex(vgDir).filter(e => e.files.includes(file))
 
     if (entries.length === 0) {
       console.log(`No sessions reference ${file}`)
+      console.log(`hint: cogitlog query "${path.basename(file)}" searches the text of every session`)
       return
     }
 
@@ -478,6 +712,67 @@ program
           }
         }
       }
+    }
+  })
+
+// ── context ───────────────────────────────────────────────────────────────────
+//
+// Everything ever recorded about a file, newest first. `why` answers "what was
+// decided", this answers "what is known" — including the attempts that failed
+// and the doubts nobody resolved.
+//
+// This command was promised by the MCP server and by generated CLAUDE.md blocks
+// long before it existed here; calling it returned `unknown command 'context'`.
+
+program
+  .command('context <file>')
+  .description('Show every event that references a file, newest session first')
+  .option('--brief', 'Last 3 sessions only, one line per event')
+  .option('-n, --limit <n>', 'Max sessions to show')
+  .action((file: string, opts: { brief?: boolean; limit?: string }) => {
+    const vgDir = requireVibegitDir()
+    const p = vgPaths(vgDir)
+
+    const limit = opts.limit ? parseInt(opts.limit, 10) : opts.brief ? 3 : Infinity
+    const entries = loadIndex(vgDir)
+      .filter(e => e.files.includes(file))
+      .sort((a, b) => (b.started_at > a.started_at ? 1 : -1))
+
+    if (entries.length === 0) {
+      console.log(`No sessions reference ${file}`)
+      console.log(`hint: cogitlog query "${path.basename(file)}" searches the text of every session`)
+      return
+    }
+
+    const shown = entries.slice(0, limit)
+    for (const entry of shown) {
+      const sessionFile = p.session(entry.session_id)
+      if (!fs.existsSync(sessionFile)) continue
+      const events = readEvents(sessionFile).filter(e => {
+        if (!('files' in e) || !e.files.some(f => f.path === file)) return false
+        // `close` snapshots every changed file, so it matches almost everything.
+        // Keep it only when it carries an outcome note worth reading.
+        if (e.type === 'close') return Boolean(e.outcome_note)
+        return true
+      })
+      if (events.length === 0) continue
+
+      console.log(`\n── ${entry.started_at.slice(0, 10)}  ${entry.session_id}  (${entry.outcome})`)
+      console.log(`   ${entry.intent}`)
+      for (const e of events) {
+        console.log(`   [${e.type}] ${describeEvent(e)}`)
+        if (opts.brief) continue
+        if (e.type === 'decision') {
+          for (const alt of e.alternatives) console.log(`     ✗ ${alt.option}: ${alt.reason_rejected}`)
+        }
+        if (e.type === 'attempt' && e.outcome !== 'succeeded') {
+          console.log(`     ${e.outcome}${e.reason ? `: ${e.reason}` : ''}`)
+        }
+      }
+    }
+
+    if (entries.length > shown.length) {
+      console.log(`\n(${entries.length - shown.length} older session(s) not shown — use -n)`)
     }
   })
 
@@ -518,6 +813,7 @@ program
     const close = events.find(e => e.type === 'close') as any
     const entries = readIndex(p.index)
     const entry = entries.find(e => e.session_id === id)
+    const links = deriveLinks(events)
 
     console.log(`Session : ${id}`)
     console.log(`Intent  : ${begin?.intent ?? '(unknown)'}`)
@@ -526,14 +822,25 @@ program
     console.log(`Outcome : ${close?.outcome ?? entry?.outcome ?? 'in_progress'}`)
     if (close?.outcome_note) console.log(`Note    : ${close.outcome_note}`)
     if (entry?.tags?.length) console.log(`Tags    : ${entry.tags.join(', ')}`)
+    if (links.length) console.log(`Links   : ${links.join(', ')}`)
     console.log(`Files   : ${entry?.files?.join(', ') || '(none)'}`)
     console.log('')
 
     for (const e of events) {
       if (e.type === 'begin' || e.type === 'close') continue
       const ts = e.at.slice(11, 16) // HH:MM
-      const body = (e as any).body ?? ''
-      console.log(`[${ts}] ${e.type.toUpperCase().padEnd(11)} ${body}`)
+      const body = String((e as any).body ?? '')
+      const description = describeEvent(e)
+      console.log(`[${ts}] ${e.type.toUpperCase().padEnd(11)} ${description}`)
+      // Print only what the description left out: when it came from the body's
+      // first line, repeating that line adds nothing.
+      const lines = body.trim() ? body.trim().split('\n') : []
+      const rest = lines[0]?.trim() === description ? lines.slice(1) : lines
+      while (rest.length && !rest[0].trim()) rest.shift()
+      for (const line of rest) console.log(`             ${line}`)
+      if (((e as any).links ?? []).length > 0) {
+        console.log(`             ↔ ${(e as any).links.join(', ')}`)
+      }
       if (e.type === 'decision' && e.alternatives.length > 0) {
         for (const alt of e.alternatives) {
           console.log(`             ✗ ${alt.option}: ${alt.reason_rejected}`)
@@ -551,49 +858,80 @@ program
 
 // ── query ─────────────────────────────────────────────────────────────────────
 //
+// Searches everything by default. Until 0.7 the default only looked at `intent`
+// and `outcome_note`, so a store holding a full note about X answered
+// "No results" for X — a silent lie that reads exactly like an empty store.
+// The old behavior is still available as --shallow.
+//
 // Output contract (--json):
 //   One JSON object per line:
 //   { session_id, intent, outcome, started_at, source: "index"|"deep", matching_events: Event[] }
 //
 //   matching_events is [] when source is "index".
 
+/** Every field of an event whose text a search should look at. */
+function searchableEventText(e: SessionEvent): string {
+  const parts: string[] = [describeEvent(e)]
+  if ('body' in e) parts.push(String((e as any).body ?? ''))
+  if (e.type === 'decision') {
+    for (const alt of e.alternatives) parts.push(alt.option, alt.reason_rejected)
+  }
+  if (e.type === 'attempt') parts.push(e.outcome, e.reason ?? '')
+  if (e.type === 'begin') parts.push(e.intent, e.context ?? '')
+  if (e.type === 'close') parts.push(e.outcome, e.outcome_note ?? '')
+  for (const l of (e as any).links ?? []) parts.push(l)
+  return parts.join('\n').toLowerCase()
+}
+
+function searchableIndexText(entry: IndexEntry): string {
+  return [
+    entry.intent,
+    entry.outcome_note ?? '',
+    ...entry.tags,
+    ...(entry.digest ?? []).map(d => d.description),
+  ].join('\n').toLowerCase()
+}
+
 program
   .command('query <text>')
-  .description('Search sessions by intent and outcome_note')
-  .option('--deep', 'Also search event body fields in session files')
+  .description('Search every session — intent, descriptions, bodies, alternatives, tags')
+  .option('--shallow', 'Only search the index (intent, outcome note, tags, descriptions)')
+  .option('--deep', 'Deprecated: deep search is the default since 0.7')
   .option('--json', 'Output as JSONL (one object per match)')
-  .action((text: string, opts: { deep?: boolean; json?: boolean }) => {
+  .action((text: string, opts: { shallow?: boolean; deep?: boolean; json?: boolean }) => {
     const vgDir = requireVibegitDir()
     const p = vgPaths(vgDir)
     const needle = text.toLowerCase()
-    const entries = readIndex(p.index)
+    const entries = loadIndex(vgDir)
 
     type Match = { entry: IndexEntry; source: 'index' | 'deep'; matchingEvents: SessionEvent[] }
     const results: Match[] = []
 
     for (const entry of entries) {
-      const inIndex =
-        entry.intent.toLowerCase().includes(needle) ||
-        (entry.outcome_note ?? '').toLowerCase().includes(needle)
-
-      if (inIndex) {
+      if (searchableIndexText(entry).includes(needle)) {
         results.push({ entry, source: 'index', matchingEvents: [] })
         continue
       }
 
-      if (opts.deep) {
-        const sessionFile = p.session(entry.session_id)
-        if (!fs.existsSync(sessionFile)) continue
-        const events = readEvents(sessionFile)
-        const hits = events.filter(e => 'body' in e && (e as any).body.toLowerCase().includes(needle))
-        if (hits.length > 0) {
-          results.push({ entry, source: 'deep', matchingEvents: hits })
-        }
+      if (opts.shallow) continue
+
+      const sessionFile = p.session(entry.session_id)
+      if (!fs.existsSync(sessionFile)) continue
+      const hits = readEvents(sessionFile).filter(e => searchableEventText(e).includes(needle))
+      if (hits.length > 0) {
+        results.push({ entry, source: 'deep', matchingEvents: hits })
       }
     }
 
     if (results.length === 0) {
-      console.log('No results')
+      if (opts.json) return
+      if (entries.length === 0) {
+        console.log('No results — this store has no sessions yet.')
+      } else if (opts.shallow) {
+        console.log(`No results in ${entries.length} session(s). Drop --shallow to search event bodies too.`)
+      } else {
+        console.log(`No results — searched every event of ${entries.length} session(s).`)
+      }
       return
     }
 
@@ -608,10 +946,10 @@ program
           matching_events: matchingEvents,
         }))
       } else {
-        const tag = source === 'deep' ? `[deep +${matchingEvents.length}]` : '[index]'
+        const tag = source === 'deep' ? `[+${matchingEvents.length}]` : '[index]'
         console.log(`${tag} ${entry.session_id} — ${entry.intent} (${entry.outcome})`)
         for (const e of matchingEvents) {
-          console.log(`  [${e.type}] ${(e as any).body}`)
+          console.log(`  [${e.type}] ${describeEvent(e)}`)
         }
       }
     }
@@ -623,10 +961,11 @@ program
   .command('log')
   .description('List recent sessions')
   .option('-n, --limit <n>', 'Max sessions to show', '20')
-  .action((opts: { limit: string }) => {
+  .option('-d, --descriptions', 'Also print a one-line description per event')
+  .action((opts: { limit: string; descriptions?: boolean }) => {
     const vgDir = requireVibegitDir()
     const p = vgPaths(vgDir)
-    const entries = readIndex(p.index)
+    const entries = loadIndex(vgDir)
       .sort((a, b) => (b.started_at > a.started_at ? 1 : -1))
       .slice(0, parseInt(opts.limit, 10))
 
@@ -639,6 +978,15 @@ program
       const date = e.started_at.slice(0, 10)
       const outcome = e.outcome.padEnd(13)
       console.log(`${date}  ${outcome}  ${e.session_id}  ${e.intent}`)
+
+      if (!opts.descriptions) continue
+      // Entries written before spec 0.4 have no digest — derive it on the fly
+      // rather than showing nothing for the sessions that predate the field.
+      const digest = e.digest ?? deriveDigest(readEvents(p.session(e.session_id)))
+      for (const d of digest) {
+        console.log(`${' '.repeat(28)}· ${d.type.padEnd(11)} ${d.description}`)
+      }
+      if (e.outcome_note) console.log(`${' '.repeat(28)}→ ${e.outcome_note}`)
     }
   })
 
@@ -655,7 +1003,12 @@ program
     resolveInterrupted(vgDir)
     const id = getCurrentId(p.current)
 
-    if (!id) { console.log('No active session'); return }
+    if (!id) {
+      console.log('No active session')
+      const entries = loadIndex(vgDir)
+      console.log(`Sessions: ${entries.length}`)
+      return
+    }
 
     const events = readEvents(p.session(id))
     const begin = events.find(e => e.type === 'begin') as any
@@ -674,7 +1027,7 @@ program
 
 program
   .command('repair')
-  .description('Rebuild and deduplicate index.jsonl from session files')
+  .description('Rebuild index.jsonl from the session files (also backfills descriptions)')
   .action(() => {
     const vgDir = requireVibegitDir()
     const p = vgPaths(vgDir)
@@ -684,39 +1037,15 @@ program
       return
     }
 
-    const activeId = getCurrentId(p.current)
-    const files = fs.readdirSync(p.sessions).filter(f => f.endsWith('.jsonl'))
-    const entries: IndexEntry[] = []
-
-    for (const file of files) {
-      const sessionId = file.replace('.jsonl', '')
-      const events = readEvents(path.join(p.sessions, file))
-      if (events.length === 0) continue
-
-      const begin = events.find(e => e.type === 'begin') as any
-      const close = events.find(e => e.type === 'close') as any
-
-      let outcome: IndexEntry['outcome']
-      if (close) outcome = close.outcome
-      else if (sessionId === activeId) outcome = 'in_progress'
-      else outcome = 'interrupted'
-
-      entries.push({
-        session_id: sessionId,
-        index_version: 1,
-        started_at: begin?.at ?? events[0].at,
-        closed_at: close?.at ?? null,
-        agent: { tool: AGENT_TOOL, model: null },
-        git_head: begin?.git_head ?? null,
-        intent: begin?.intent ?? '',
-        outcome,
-        outcome_note: close?.outcome_note ?? null,
-        files: deriveFiles(events),
-        tags: [],
-      })
+    if (!fs.existsSync(p.config)) {
+      fs.writeFileSync(
+        p.config,
+        JSON.stringify({ spec_version: SPEC_VERSION, created_at: now() }, null, 2) + '\n',
+      )
+      console.log('Created missing config.json')
     }
 
-    writeIndex(p.index, entries)
+    const entries = rebuildIndex(vgDir)
     console.log(`Rebuilt index: ${entries.length} session(s)`)
   })
 
@@ -734,18 +1063,55 @@ This repo records AI agent sessions in .cogitlog/ alongside git history.
 Each session captures intent, decisions, attempts, and uncertainties so
 future agents (and humans) can understand not just *what* changed but *why*.
 
-EXPECTED BEHAVIOR
------------------
+READING THE LOG (do this first)
+-------------------------------
+Before changing code that looks arbitrary, check whether someone already
+explained it — or already tried your idea and logged why it failed:
+
+  cogitlog log                    # recent sessions, newest first
+  cogitlog log -d                 # ...with one description per event
+  cogitlog why <file>             # decisions that touched a file
+  cogitlog query "<text>"         # searches everything: descriptions,
+                                  # bodies, rejected alternatives, tags
+  cogitlog query "<text>" --shallow   # index only — faster, much narrower
+  cogitlog show <session-id>      # one session in full
+
+The store does not depend on this CLI. .cogitlog/sessions/*.jsonl is plain
+JSONL — one event per line, one file per session. Anyone can read it with
+cat, jq, or an editor, with nothing installed.
+
+WRITING THE LOG
+---------------
 At the start of every task, open a session:
 
   cogitlog begin "<what you intend to do>" [--context "<extra background>"]
 
-During the task, record meaningful events:
+  If a previous session was left open, it is auto-closed as interrupted.
 
-  cogitlog note "<observation or progress update>"
-  cogitlog decision "<what you chose and why>" [-a "<option:reason rejected>"]
-  cogitlog attempt "<what you tried>" --outcome failed --reason "<why it failed>"
-  cogitlog uncertainty "<what you don't know or aren't confident about>"
+During the task, record events when they happen:
+
+  After choosing between alternatives:
+    cogitlog decision "<what you chose and why>" [-a "<option:reason rejected>"]
+
+  After a fix, implementation, or debugging attempt:
+    cogitlog attempt "<what you tried>" [succeeded|failed|partial]
+
+  When you notice something worth remembering:
+    cogitlog note "<observation or progress update>"
+
+  Before closing, if any choice felt borderline:
+    cogitlog uncertainty "<what you don't know or aren't confident about>"
+
+A failed attempt is worth more than a successful one — it is what keeps the
+next person from walking back into the same dead end.
+
+Every event takes an optional one-line summary, which is what \`log -d\` and
+\`query\` scan. Multi-line bodies use their first line automatically:
+
+    cogitlog note "<long body>" -d "<one-line summary>"
+
+Events can point at other sessions, so a decision can name the one it
+supersedes — either \`--relates-to <session-id>\` or [[session-id]] inline.
 
 At the end of the task, close the session:
 
@@ -754,13 +1120,10 @@ At the end of the task, close the session:
 Use interrupted if you hit a context limit or are stopping mid-task.
 A future agent can resume with: cogitlog begin "<intent>" --resume <session-id>
 
-QUERYING HISTORY
-----------------
-  cogitlog log                    # list recent sessions
-  cogitlog show [session-id]      # full detail of a session
-  cogitlog why <file>             # decisions that touched a file
-  cogitlog query "<text>"         # search by intent / outcome note
-  cogitlog query "<text>" --deep  # also search event bodies
+MAINTENANCE
+-----------
+  cogitlog repair                 # rebuild the index from the session files
+                                  # (needed for stores written before 0.7)
 
 CURRENT STATUS
 --------------`)
@@ -780,8 +1143,9 @@ CURRENT STATUS
       console.log(`  Intent         : ${begin?.intent ?? '(unknown)'}`)
       console.log(`  Events so far  : ${events.length}`)
     } else {
-      const entries = readIndex(p.index)
+      const entries = loadIndex(vgDir)
       console.log(`  No active session.`)
+      console.log(`  Sessions       : ${entries.length}`)
       if (entries.length > 0) {
         const last = entries.sort((a, b) => (b.started_at > a.started_at ? 1 : -1))[0]
         console.log(`  Last session   : ${last.session_id} — ${last.intent} (${last.outcome})`)

@@ -31,26 +31,54 @@ cogitlog uncertainty "not sure if prefers-color-scheme should override manual to
 cogitlog close --outcome completed
 ```
 
+## Reading someone else's log
+
+Inheriting a repo that has a `.cogitlog/` is the case this exists for:
+
+```sh
+cogitlog log -d                 # every session, with one line per event
+cogitlog query "dark mode"      # searches descriptions, bodies, rejected alternatives
+cogitlog why src/theme.ts       # decisions that touched this file
+cogitlog show <session-id>      # one session in full
+```
+
+`query` searches everything by default. Before 0.7 it only matched session intents,
+so a store holding a full note about a topic answered `No results` when asked for it —
+a failure that reads exactly like an empty repository. `--shallow` restores the old,
+narrower search.
+
+**You do not need this CLI to read a store.** `.cogitlog/sessions/*.jsonl` is plain
+JSONL — one event per line, one file per session:
+
+```sh
+cat .cogitlog/sessions/*.jsonl | jq -r 'select(.type=="decision") | .body'
+```
+
 ## Commands
 
 | Command | Description |
 |---|---|
-| `init` | Initialize `.cogitlog/` in the current directory |
-| `remindme` | Append cogitlog reminder to agent instruction files (CLAUDE.md, etc.) |
+| `init` | Initialize `.cogitlog/` — safe to re-run; repairs a missing index and refreshes instruction files |
+| `remindme [--force]` | Write/refresh the cogitlog block in agent instruction files (CLAUDE.md, etc.) |
 | `begin "<intent>"` | Open a new session |
 | `note "<text>"` | Add a free-form note |
 | `decision "<text>"` | Record a decision (supports `--alternative "option:reason"`) |
-| `attempt "<text>" --outcome <succeeded\|failed\|partial>` | Record an attempt and its outcome |
+| `attempt "<text>" [<succeeded\|failed\|partial>]` | Record an attempt and its outcome |
 | `uncertainty "<text>"` | Flag something you are not sure about |
 | `close --outcome <completed\|partial\|abandoned\|interrupted>` | Close the current session |
-| `log` | List recent sessions |
+| `log [-d]` | List recent sessions; `-d` adds one description line per event |
 | `show [session-id]` | Show full detail of a session |
 | `why <file>` | Show decisions that touched a file |
-| `query "<text>"` | Search sessions by intent / outcome note |
+| `query "<text>"` | Search everything: descriptions, bodies, rejected alternatives, tags |
 | `status` | Show the current session status |
 | `onboard` | Print usage instructions (useful to paste into agent context) |
 | `hook install` | Install a post-commit hook that auto-closes sessions on `git commit` |
 | `repair` | Rebuild `index.jsonl` from session files |
+
+Every event-writing command accepts `-d, --description "<one-line summary>"` and
+`--relates-to <session-id>`. Without `-d`, the first line of a multi-line body becomes
+the description. Descriptions are what `log -d` and `query` scan, so a store stays
+navigable as it grows — the same property that makes a well-kept notebook usable.
 
 ## How it works
 

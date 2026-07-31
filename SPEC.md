@@ -1,4 +1,4 @@
-# cogitlog format spec v0.3
+# cogitlog format spec v0.4
 
 Semantic memory protocol for AI agents working in codebases.
 Lives alongside git in `.cogitlog/`. Does not replace git.
@@ -29,7 +29,7 @@ Written once on `cogitlog init`. Never updated automatically.
 
 ```jsonc
 {
-  "spec_version": "0.3",
+  "spec_version": "0.4",
   "created_at": "2026-03-31T10:42:17Z"
 }
 ```
@@ -90,11 +90,18 @@ The index is append-only. When a session is updated (e.g. `close` is written), a
   "outcome": "completed",              // "completed" | "partial" | "abandoned" | "interrupted" | "in_progress"
   "outcome_note": "Skipped refresh token logic, left TODO",  // optional
   "files": ["src/auth.ts", "src/middleware.ts"],  // flat path list, derived from all session events
-  "tags": ["auth", "refactor"]         // optional, agent-defined
+  "tags": ["auth", "refactor"],        // optional, agent-defined
+  "digest": [                          // 0.4+. One line per event. Absent on entries written by 0.3.
+    { "seq": 1, "type": "decision", "description": "RS256 over HS256 — public key must be shareable" },
+    { "seq": 2, "type": "attempt",  "description": "token validation as a Fastify hook" }
+  ],
+  "links": ["2026-03-30T091500-77c1e0aa"]  // 0.4+. Union of every event's `links`, plus `resumed_from`.
 }
 ```
 
 `files` in the index is the union of all `path` values from all `files` arrays across all events in the session. This is the canonical derivation rule — `cogitlog repair` and `cogitlog close` must produce identical lists using this rule.
+
+`digest` exists so an entire store can be scanned — "what is in here?" — by reading `index.jsonl` alone, without opening a single session file. It holds one `description` per event, excluding `begin` and `close` (whose summaries are already `intent` and `outcome_note`). It is derived, like `files`: `cogitlog repair` rebuilds it for stores written before 0.4.
 
 ---
 
@@ -113,6 +120,23 @@ One line per event, in chronological order. Each event shares a common envelope:
 ```
 
 `seq` is zero-indexed and monotonically increasing within a session. Because session files are written by a single owner, seq can be determined by reading the last line of the file before appending.
+
+### Prose fields (0.4+)
+
+Every event that carries a `body` — `note`, `decision`, `attempt`, `uncertainty` — may also carry:
+
+```jsonc
+{
+  "description": "RS256 over HS256 — public key must be shareable",  // one-line summary, or null
+  "links": ["2026-03-30T091500-77c1e0aa"]                            // session ids this event points at
+}
+```
+
+**`description`** is the one-line summary that `query`, `log -d` and `show` scan. It is what makes a store of hundreds of events navigable: read the descriptions, open only what matters.
+
+Both fields are optional and may be absent entirely — events written before 0.4 have neither. Readers **must** compute a description when the field is missing or null, by taking the first line of `body` (truncated to 120 characters). This is what keeps pre-0.4 stores scannable without rewriting them. Writers should store `description` only when it differs from that fallback: an explicit `-d`, or the first line of a multi-line body.
+
+**`links`** records that this event refers to another session — the decision it supersedes, the interrupted work it picks up. Writers populate it from `--relates-to` and from any `[[session-id]]` appearing in the body. Links are informational and one-directional; there is no back-pointer. To find what points at a session, search the index for its id.
 
 ### Event types
 
@@ -239,23 +263,56 @@ All commands that write events accept `--file <path>` (repeatable) to add file r
 
 | Command | Description |
 |---|---|
-| `cogitlog init` | Initialize `.cogitlog/` in the current repo |
+All commands that write prose events also accept `--description <text>` (`-d`) and `--relates-to <session-id>` (repeatable).
+
+| Command | Description |
+|---|---|
+| `cogitlog init` | Initialize `.cogitlog/` — safe to re-run; repairs a missing index and refreshes instruction files |
 | `cogitlog begin "<intent>" [--context "<text>"] [--resume <session-id>]` | Open a new session |
-| `cogitlog note "<text>" [--file <path>]` | Add a note to the current session |
-| `cogitlog decision "<text>" [--file <path>]` | Record a decision |
-| `cogitlog attempt "<text>" --outcome <outcome> [--file <path>]` | Record an attempt |
-| `cogitlog uncertainty "<text>" [--file <path>]` | Flag an uncertainty |
+| `cogitlog note "<text>" [-d "<summary>"] [--file <path>]` | Add a note to the current session |
+| `cogitlog decision "<text>" [-a "<option:reason>"] [-d "<summary>"]` | Record a decision |
+| `cogitlog attempt "<text>" [<outcome>] [--reason "<text>"]` | Record an attempt (outcome defaults to `succeeded`) |
+| `cogitlog uncertainty "<text>" [-d "<summary>"]` | Flag an uncertainty |
 | `cogitlog close [--outcome <outcome>] [--note "<text>"]` | Close the current session |
 | `cogitlog why <file>` | Show `decision` events that reference a file |
 | `cogitlog why <file> --mentions` | Show all events that reference a file |
-| `cogitlog query "<text>"` | Search `intent` and `outcome_note` across the index |
-| `cogitlog query "<text>" --deep` | Also search all event `body` fields in session files |
-| `cogitlog log` | List recent sessions from index |
-| `cogitlog repair` | Rebuild and deduplicate `index.jsonl` from session files |
+| `cogitlog query "<text>"` | Search every session — descriptions, bodies, alternatives, tags, links |
+| `cogitlog query "<text>" --shallow` | Index only: `intent`, `outcome_note`, `tags`, `digest` |
+| `cogitlog log [-d]` | List recent sessions; `-d` adds one description line per event |
+| `cogitlog repair` | Rebuild `index.jsonl` from session files; backfills `digest` and `links` |
+| `cogitlog remindme [--force]` | Write/refresh the cogitlog block in agent instruction files |
 
-`cogitlog query` performs case-insensitive substring matching against `intent` and `outcome_note` in `index.jsonl`. `--deep` additionally searches `body` fields in all session event files. No fuzzy or semantic matching — exact substring only in v0.3.
+`cogitlog query` performs case-insensitive substring matching — no fuzzy or semantic matching. As of 0.4 it searches everything by default: index fields, every event `description` and `body`, `alternatives` (both `option` and `reason_rejected`), `attempt.reason`, tags, and links. `--shallow` restricts it to the index. `--deep` is accepted and ignored — it is what the full search used to be called.
+
+The default changed because the narrow default failed silently: a store containing a full note about a topic answered `No results` when queried for it, which is indistinguishable from an empty store. A search that under-reports is worse than a slow one.
 
 If `cogitlog close` is called without `--outcome`, it prompts interactively. If stdout is not a TTY (e.g. called from a script or agent), `--outcome` is required.
+
+---
+
+## Index health
+
+`index.jsonl` is a derived cache, and a store whose index is missing is still a complete store — the session files hold everything. Readers must therefore not equate an empty index with an empty store.
+
+Before reading the index, a reader compares the session ids in `sessions/` against those in `index.jsonl`:
+
+| State | Meaning | Required behavior |
+|---|---|---|
+| index covers every session file | healthy | proceed |
+| `sessions/` non-empty, index missing or empty | store predates the index, or the index was lost | rebuild it in place — nothing is lost, since an absent index holds no information |
+| index exists but omits some session files | index is stale | report the counts and point at `cogitlog repair` — do **not** rebuild silently, because `tags` exist only in the index and would be discarded |
+
+The distinction matters: rebuilding is lossless only when there is nothing to lose. `tags` are the one field with no source outside the index, so a rebuild over a populated index must be an explicit user action.
+
+---
+
+## Compatibility
+
+**0.3 → 0.4** is additive. Every new field — `description` and `links` on events, `digest` and `links` on index entries — is optional, and 0.3 readers ignore unknown fields by rule (see *Forward-compatible* below). A 0.4 store is readable by a 0.3 reader with no loss beyond the new fields themselves.
+
+In the other direction, a 0.3 store is fully usable by a 0.4 reader: missing descriptions are derived from the first line of `body` at read time, so old events are scannable without being rewritten. Only the index `digest` needs materializing, and `cogitlog repair` does it in one pass. Running it is optional — it makes `--shallow` queries and `log -d` faster on old sessions, nothing more.
+
+Session files are never rewritten by an upgrade. Existing events keep the exact bytes they were written with.
 
 ---
 

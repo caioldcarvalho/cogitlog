@@ -39,6 +39,7 @@ Inheriting a repo that has a `.cogitlog/` is the case this exists for:
 cogitlog log -d                 # every session, with one line per event
 cogitlog query "dark mode"      # searches descriptions, bodies, rejected alternatives
 cogitlog why src/theme.ts       # decisions that touched this file
+cogitlog context src/theme.ts   # everything recorded about this file
 cogitlog show <session-id>      # one session in full
 ```
 
@@ -69,11 +70,13 @@ cat .cogitlog/sessions/*.jsonl | jq -r 'select(.type=="decision") | .body'
 | `log [-d]` | List recent sessions; `-d` adds one description line per event |
 | `show [session-id]` | Show full detail of a session |
 | `why <file>` | Show decisions that touched a file |
+| `context <file>` | Show every event related to a file (`--brief` for the last 3 sessions) |
 | `query "<text>"` | Search everything: descriptions, bodies, rejected alternatives, tags |
 | `status` | Show the current session status |
 | `onboard` | Print usage instructions (useful to paste into agent context) |
 | `hook install` | Install a post-commit hook that auto-closes sessions on `git commit` |
 | `repair` | Rebuild `index.jsonl` from session files |
+| `install-skills` | Install the `/cogitlog-read` and `/cogitlog-write` Claude Code commands |
 
 Every event-writing command accepts `-d, --description "<one-line summary>"` and
 `--relates-to <session-id>`. Without `-d`, the first line of a multi-line body becomes

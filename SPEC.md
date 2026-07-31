@@ -30,7 +30,8 @@ Written once on `cogitlog init`. Never updated automatically.
 ```jsonc
 {
   "spec_version": "0.4",
-  "created_at": "2026-03-31T10:42:17Z"
+  "created_at": "2026-03-31T10:42:17Z",
+  "update_check": true    // optional; set false to silence CLI update notices in this repo
 }
 ```
 
@@ -273,7 +274,7 @@ All commands that write prose events also accept `--description <text>` (`-d`) a
 | `cogitlog decision "<text>" [-a "<option:reason>"] [-d "<summary>"]` | Record a decision |
 | `cogitlog attempt "<text>" [<outcome>] [--reason "<text>"]` | Record an attempt (outcome defaults to `succeeded`) |
 | `cogitlog uncertainty "<text>" [-d "<summary>"]` | Flag an uncertainty |
-| `cogitlog close [--outcome <outcome>] [--note "<text>"]` | Close the current session |
+| `cogitlog close [--outcome <outcome>] [--note "<text>"] [--if-open]` | Close the current session; `--if-open` is a no-op when none is open |
 | `cogitlog why <file>` | Show `decision` events that reference a file |
 | `cogitlog why <file> --mentions` | Show all events that reference a file |
 | `cogitlog query "<text>"` | Search every session — descriptions, bodies, alternatives, tags, links |
@@ -281,6 +282,8 @@ All commands that write prose events also accept `--description <text>` (`-d`) a
 | `cogitlog log [-d]` | List recent sessions; `-d` adds one description line per event |
 | `cogitlog repair` | Rebuild `index.jsonl` from session files; backfills `digest` and `links` |
 | `cogitlog remindme [--force]` | Write/refresh the cogitlog block in agent instruction files |
+| `cogitlog guard [--quiet] [--strict]` | Warn when a commit carries no recorded reasoning. Exits 0 unless `--strict` |
+| `cogitlog hook install [--remind]` | Post-commit auto-close; `--remind` adds the pre-commit reminder |
 
 `cogitlog query` performs case-insensitive substring matching — no fuzzy or semantic matching. As of 0.4 it searches everything by default: index fields, every event `description` and `body`, `alternatives` (both `option` and `reason_rejected`), `attempt.reason`, tags, and links. `--shallow` restricts it to the index. `--deep` is accepted and ignored — it is what the full search used to be called.
 

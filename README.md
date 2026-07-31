@@ -74,7 +74,8 @@ cat .cogitlog/sessions/*.jsonl | jq -r 'select(.type=="decision") | .body'
 | `query "<text>"` | Search everything: descriptions, bodies, rejected alternatives, tags |
 | `status` | Show the current session status |
 | `onboard` | Print usage instructions (useful to paste into agent context) |
-| `hook install` | Install a post-commit hook that auto-closes sessions on `git commit` |
+| `guard` | Print what to record when a commit has no reasoning logged (never fails) |
+| `hook install [--remind]` | Post-commit hook to auto-close sessions; `--remind` adds the pre-commit reminder |
 | `repair` | Rebuild `index.jsonl` from session files |
 | `install-skills` | Install the `/cogitlog-read` and `/cogitlog-write` Claude Code commands |
 
@@ -108,3 +109,31 @@ This appends the reminder to any existing instruction files, or creates `CLAUDE.
 ## License
 
 MIT
+
+## Reminders at commit time
+
+```sh
+cogitlog hook install --remind
+```
+
+Installs a `post-commit` hook that closes the open session, and a `pre-commit` hook that
+prints the command to run when a commit carries no recorded reasoning:
+
+```
+cogitlog: nothing recorded for 3 files. To leave a trace:
+  cogitlog begin "<what you set out to do>"
+  cogitlog decision "<what you chose and why>" -f src/auth.ts -f src/session.ts
+  (nothing worth recording? ignore this, or set COGITLOG_SKIP=1)
+```
+
+**It never fails a commit.** Not every commit deserves a session, and a hook that blocks
+on a lockfile bump only teaches everyone to reach for `--no-verify`. Nobody else is
+affected either: `.git/hooks` is not versioned, so cloning installs nothing, and the
+script no-ops when `cogitlog` is not on `PATH`.
+
+## Update notices
+
+cogitlog checks the registry at most once a day, in a detached process, and mentions a
+newer version on **stderr** — never stdout, which `--json` consumers parse. Disable with
+`COGITLOG_NO_UPDATE_CHECK=1`, with `"update_check": false` in `.cogitlog/config.json`, or
+let it stay quiet automatically under `CI`.

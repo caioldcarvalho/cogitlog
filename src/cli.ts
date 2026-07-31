@@ -25,7 +25,8 @@ import {
   resolveInterrupted,
   setCurrentId,
 } from './io'
-import { autoFileRefs, getGitRoot, getHead, resolveFileRefs } from './git'
+import { autoFileRefs, getChangedFiles, getGitRoot, getHead, getStagedFiles, resolveFileRefs } from './git'
+import { REFRESH_COMMAND, printUpdateNotice, refreshCache, scheduleUpdateCheck } from './update'
 import { withLock } from './lock'
 import type { AttemptOutcome, FileRef, IndexEntry, SessionEvent, SessionOutcome } from './types'
 
@@ -151,11 +152,13 @@ async function promptOutcome(): Promise<SessionOutcome> {
 
 // ─── Program ─────────────────────────────────────────────────────────────────
 
+const VERSION = '0.9.0'
+
 const program = new Command()
 program
   .name('cogitlog')
   .description('Semantic memory protocol for AI agents working in codebases')
-  .version('0.8.0')
+  .version(VERSION)
 
 // ── init ─────────────────────────────────────────────────────────────────────
 
@@ -625,9 +628,18 @@ program
   .option('--outcome <outcome>', 'completed | partial | abandoned | interrupted')
   .option('--note <text>', 'Outcome note')
   .option('-t, --tag <tag>', 'Tag — repeatable (merged with tags from begin)', collect, [] as string[])
-  .action(async (opts: { outcome?: string; note?: string; tag: string[] }) => {
+  .option('--if-open', 'Do nothing, quietly, when no session is open (for hooks)')
+  .action(async (opts: { outcome?: string; note?: string; tag: string[]; ifOpen?: boolean }) => {
     const vgDir = requireVibegitDir()
     const p = vgPaths(vgDir)
+
+    // Hooks fire on every commit, including the ones made with no session open.
+    // Without this they print "No active session" as an error each time, which
+    // trains people to ignore everything cogitlog says.
+    if (opts.ifOpen) {
+      resolveInterrupted(vgDir)
+      if (!getCurrentId(p.current)) return
+    }
     const sessionId = requireActiveSession(vgDir)
 
     const validOutcomes: SessionOutcome[] = ['completed', 'partial', 'abandoned', 'interrupted']
@@ -1193,6 +1205,82 @@ CURRENT STATUS
 
 // ── hook ─────────────────────────────────────────────────────────────────────
 
+// ── guard ─────────────────────────────────────────────────────────────────────
+//
+// The reminder the pre-commit hook prints. It never fails a commit: not every
+// commit deserves a session — a lockfile bump, a typo fix, a formatting pass — and
+// a hook that blocks on those only teaches people to reach for --no-verify, which
+// kills the reminder entirely.
+//
+// What it can do is make the cheap path cheap: instead of "you forgot to log
+// something", it prints the command already filled in with this commit's files.
+// Copying a line is easier than ignoring it.
+
+/** Files staged for commit, falling back to everything changed in the tree. */
+function commitFiles(gitRoot: string | null): string[] {
+  const staged = getStagedFiles(gitRoot ?? undefined)
+  const files = staged.length > 0 ? staged : getChangedFiles(gitRoot ?? undefined)
+  return files.filter(f => !f.startsWith('.cogitlog/'))
+}
+
+const GUARD_FILE_LIMIT = 6
+
+function fileFlags(files: string[]): string {
+  const shown = files.slice(0, GUARD_FILE_LIMIT)
+  const flags = shown.map(f => `-f ${f}`).join(' ')
+  return files.length > shown.length ? `${flags} …` : flags
+}
+
+program
+  .command('guard')
+  .description('Warn when a commit carries no recorded reasoning (never fails — see --strict)')
+  .option('--strict', 'Exit 1 instead of 0, for anyone who wants a blocking hook')
+  .option('--quiet', 'Say nothing when there is nothing to warn about')
+  .action((opts: { strict?: boolean; quiet?: boolean }) => {
+    if (process.env.COGITLOG_SKIP) return
+
+    const vgDir = findVibegitDir()
+    // A repo that does not use cogitlog is not doing anything wrong.
+    if (!vgDir) return
+
+    const p = vgPaths(vgDir)
+    resolveInterrupted(vgDir)
+    const sessionId = getCurrentId(p.current)
+    const gitRoot = getGitRoot()
+    const files = commitFiles(gitRoot)
+
+    const events = sessionId ? readEvents(p.session(sessionId)) : []
+    const recorded = events.filter(e => e.type !== 'begin' && e.type !== 'close')
+
+    if (sessionId && recorded.length > 0) {
+      if (!opts.quiet) {
+        console.error(`cogitlog: ${recorded.length} event(s) recorded in this session.`)
+      }
+      return
+    }
+
+    const subject = files.length === 0 ? 'this commit'
+      : files.length === 1 ? files[0]
+      : `${files.length} files`
+    const flags = files.length > 0 ? ` ${fileFlags(files)}` : ''
+
+    console.error('')
+    if (!sessionId) {
+      console.error(`cogitlog: nothing recorded for ${subject}. To leave a trace:`)
+      console.error(`  cogitlog begin "<what you set out to do>"`)
+      console.error(`  cogitlog decision "<what you chose and why>"${flags}`)
+    } else {
+      console.error(`cogitlog: session open for ${subject} but no events recorded. To leave a trace:`)
+      console.error(`  cogitlog decision "<what you chose and why>"${flags}`)
+    }
+    console.error(`  (nothing worth recording? ignore this, or set COGITLOG_SKIP=1)`)
+    console.error('')
+
+    if (opts.strict) process.exit(1)
+  })
+
+// ── hook ─────────────────────────────────────────────────────────────────────
+
 const hookCmd = program.command('hook').description('Manage git hooks for cogitlog')
 
 const POST_COMMIT_SCRIPT = [
@@ -1201,48 +1289,94 @@ const POST_COMMIT_SCRIPT = [
   'if command -v cogitlog >/dev/null 2>&1; then',
   '  COMMIT=$(git rev-parse HEAD 2>/dev/null)',
   '  SUBJECT=$(git log -1 --format=%s 2>/dev/null)',
-  '  cogitlog close --outcome completed --note "Committed: $SUBJECT ($COMMIT)" || true',
+  '  cogitlog close --if-open --outcome completed --note "Committed: $SUBJECT ($COMMIT)" || true',
   'fi',
 ].join('\n')
+
+/** Earlier wordings of the hooks, so `uninstall` can still recognise them. */
+const LEGACY_HOOK_LINES = [
+  '  cogitlog close --outcome completed --note "Committed: $SUBJECT ($COMMIT)" || true',
+  '  cogitlog close --outcome completed --note "Committed: $SUBJECT ($COMMIT)" 2>/dev/null || true',
+]
+
+// Both guards exist because a hook is per-clone, not per-repo: .git/hooks is not
+// versioned, so nobody gets this by cloning. And `command -v` means a teammate
+// without cogitlog installed is never affected by a hook they somehow inherited.
+// The trailing `exit 0` makes it structurally impossible to fail a commit.
+const PRE_COMMIT_SCRIPT = [
+  '#!/bin/sh',
+  '# cogitlog pre-commit hook — reminds, never blocks',
+  'if [ -z "$COGITLOG_SKIP" ] && command -v cogitlog >/dev/null 2>&1; then',
+  '  cogitlog guard --quiet || true',
+  'fi',
+  'exit 0',
+].join('\n')
+
+function installHookScript(gitRoot: string, name: string, script: string): 'installed' | 'present' {
+  const hookFile = path.join(gitRoot, '.git', 'hooks', name)
+
+  if (fs.existsSync(hookFile)) {
+    const existing = fs.readFileSync(hookFile, 'utf8')
+    if (existing.includes('cogitlog')) return 'present'
+    fs.appendFileSync(hookFile, '\n' + script + '\n')
+  } else {
+    fs.writeFileSync(hookFile, script + '\n', 'utf8')
+    fs.chmodSync(hookFile, '755')
+  }
+  return 'installed'
+}
+
+function removeHookScript(gitRoot: string, name: string, script: string): boolean {
+  const hookFile = path.join(gitRoot, '.git', 'hooks', name)
+  if (!fs.existsSync(hookFile)) return false
+
+  const content = fs.readFileSync(hookFile, 'utf8')
+  if (!content.includes('cogitlog')) return false
+
+  const cogitlogLines = new Set([...script.split('\n'), ...LEGACY_HOOK_LINES])
+  const filtered = content.split('\n').filter(line => !cogitlogLines.has(line)).join('\n')
+  // A file left holding only a shebang is a hook that does nothing — drop it.
+  if (filtered.replace(/#!.*|\s|exit 0/g, '') === '') fs.unlinkSync(hookFile)
+  else fs.writeFileSync(hookFile, filtered, 'utf8')
+  return true
+}
 
 hookCmd
   .command('install')
   .description('Install post-commit hook to auto-close sessions on git commit')
-  .action(() => {
+  .option('--remind', 'Also install a pre-commit hook that warns when a commit has no recorded reasoning')
+  .action((opts: { remind?: boolean }) => {
     const gitRoot = getGitRoot()
     if (!gitRoot) { console.error('Not inside a git repository'); process.exit(1) }
 
-    const hookFile = path.join(gitRoot, '.git', 'hooks', 'post-commit')
+    const post = installHookScript(gitRoot, 'post-commit', POST_COMMIT_SCRIPT)
+    console.log(post === 'present'
+      ? 'post-commit hook already installed'
+      : `Installed post-commit hook: ${path.join(gitRoot, '.git/hooks/post-commit')}`)
 
-    if (fs.existsSync(hookFile)) {
-      const existing = fs.readFileSync(hookFile, 'utf8')
-      if (existing.includes('cogitlog')) { console.log('Hook already installed'); return }
-      fs.appendFileSync(hookFile, '\n' + POST_COMMIT_SCRIPT + '\n')
-    } else {
-      fs.writeFileSync(hookFile, POST_COMMIT_SCRIPT + '\n', 'utf8')
-      fs.chmodSync(hookFile, '755')
+    if (opts.remind) {
+      const pre = installHookScript(gitRoot, 'pre-commit', PRE_COMMIT_SCRIPT)
+      console.log(pre === 'present'
+        ? 'pre-commit hook already installed'
+        : `Installed pre-commit hook: ${path.join(gitRoot, '.git/hooks/pre-commit')}`)
+      console.log('  It only prints a reminder — it never fails a commit.')
     }
-
-    console.log(`Installed post-commit hook: ${hookFile}`)
   })
 
 hookCmd
   .command('uninstall')
-  .description('Remove cogitlog lines from post-commit hook')
+  .description('Remove cogitlog lines from the post-commit and pre-commit hooks')
   .action(() => {
     const gitRoot = getGitRoot()
     if (!gitRoot) { console.error('Not inside a git repository'); process.exit(1) }
 
-    const hookFile = path.join(gitRoot, '.git', 'hooks', 'post-commit')
-    if (!fs.existsSync(hookFile)) { console.log('No post-commit hook found'); return }
+    const removed: string[] = []
+    if (removeHookScript(gitRoot, 'post-commit', POST_COMMIT_SCRIPT)) removed.push('post-commit')
+    if (removeHookScript(gitRoot, 'pre-commit', PRE_COMMIT_SCRIPT)) removed.push('pre-commit')
 
-    const content = fs.readFileSync(hookFile, 'utf8')
-    if (!content.includes('cogitlog')) { console.log('No cogitlog hook found'); return }
-
-    const cogitlogLines = new Set(POST_COMMIT_SCRIPT.split('\n'))
-    const filtered = content.split('\n').filter(line => !cogitlogLines.has(line)).join('\n')
-    fs.writeFileSync(hookFile, filtered, 'utf8')
-    console.log('Removed cogitlog hook')
+    console.log(removed.length > 0
+      ? `Removed cogitlog hook(s): ${removed.join(', ')}`
+      : 'No cogitlog hooks found')
   })
 
 // ── agent hooks (Claude Code integration) ────────────────────────────────────
@@ -1658,5 +1792,16 @@ program
   })
 
 // ─────────────────────────────────────────────────────────────────────────────
+
+// The refresh runs in a detached child, so this costs the current command nothing
+// but a fork, once a day. The notice itself waits for exit so it lands after the
+// output rather than on top of it.
+const refreshCmd = new Command(REFRESH_COMMAND)
+  .description('internal: refresh the cached latest-version check')
+  .action(async () => { await refreshCache() })
+program.addCommand(refreshCmd, { hidden: true })
+
+scheduleUpdateCheck()
+process.on('exit', () => printUpdateNotice(VERSION))
 
 program.parse()

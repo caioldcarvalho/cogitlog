@@ -23,6 +23,14 @@ export function getHead(cwd?: string): string | null {
   return result.length === 40 ? result : null
 }
 
+/** Returns paths of files staged for the next commit. Empty outside a commit flow. */
+export function getStagedFiles(cwd?: string): string[] {
+  return run('git diff --name-only --cached', cwd)
+    .split('\n')
+    .map(l => l.trim())
+    .filter(Boolean)
+}
+
 /** Returns paths of all files with uncommitted changes (staged + unstaged + untracked). */
 export function getChangedFiles(cwd?: string): string[] {
   const staged   = run('git diff --name-only --cached', cwd)

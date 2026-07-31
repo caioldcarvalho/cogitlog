@@ -1,5 +1,62 @@
 # Changelog
 
+## 0.9.0
+
+Two things agents and people forget: to record anything at all, and to update the CLI.
+Neither is solved by asking harder.
+
+### A reminder at the moment of commit
+
+`cogitlog guard` prints what to run when a commit carries no recorded reasoning, and
+`cogitlog hook install --remind` wires it to `pre-commit`.
+
+It **never fails a commit.** Not every commit deserves a session — a lockfile bump, a
+typo, a formatting pass — and a hook that blocks on those only teaches people to reach
+for `--no-verify`, after which the reminder is worth nothing. The installed script ends
+in a literal `exit 0`, so blocking is structurally impossible rather than a setting.
+`guard --strict` exists for anyone who disagrees and wants to wire it up themselves.
+
+The reminder is executable rather than exhortative — it prints the command already
+filled in with the commit's staged files:
+
+```
+cogitlog: nothing recorded for 3 files. To leave a trace:
+  cogitlog begin "<what you set out to do>"
+  cogitlog decision "<what you chose and why>" -f src/auth.ts -f src/session.ts
+  (nothing worth recording? ignore this, or set COGITLOG_SKIP=1)
+```
+
+Two things keep this from ever being someone else's problem: `.git/hooks` is not
+versioned, so cloning the repo installs nothing; and the script no-ops when `cogitlog`
+is not on `PATH`. What gets flagged is the absence of a record, never the absence of
+the tool.
+
+- `cogitlog guard` — `--quiet` to say nothing when there is nothing to say, `--strict`
+  to exit 1.
+- `cogitlog hook install --remind` — adds the pre-commit hook alongside the post-commit
+  one. `hook uninstall` now removes both, including hooks written by older versions.
+- `cogitlog close --if-open` — closes only if a session is open, quietly otherwise.
+  The post-commit hook now uses it: it used to print `No active session` as an error on
+  every commit made without a session, which is exactly how you train someone to ignore
+  everything a tool says.
+
+### It tells you when it is out of date
+
+A stale CLI fails in ways that look like bugs somewhere else — an install a version
+behind is missing commands that the MCP server advertises, and the resulting
+`unknown command` reads as a broken server.
+
+`cogitlog` now checks the registry at most once a day and mentions a newer version when
+one exists. Two rules keep it harmless:
+
+- **It never blocks.** The check runs in a detached child process; the command you ran
+  never waits on the network. The notice comes from the cache, on the next run.
+- **It never touches stdout.** Notices go to stderr, because `query --json` and the MCP
+  server parse stdout.
+
+Off by `COGITLOG_NO_UPDATE_CHECK=1`, by `"update_check": false` in `.cogitlog/config.json`,
+and automatically under `CI`.
+
 ## 0.8.0
 
 Four defects, all observed during a real handover across four repositories — the

@@ -42,7 +42,7 @@ cogitlog why src/theme.ts       # decisions that touched this file
 cogitlog show <session-id>      # one session in full
 ```
 
-`query` searches everything by default. Before 0.7 it only matched session intents,
+`query` searches everything by default. Before 0.8 it only matched session intents,
 so a store holding a full note about a topic answered `No results` when asked for it —
 a failure that reads exactly like an empty repository. `--shallow` restores the old,
 narrower search.

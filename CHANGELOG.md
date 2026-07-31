@@ -1,11 +1,11 @@
 # Changelog
 
-## 0.7.0
+## 0.8.0
 
-Five defects, all observed during a real handover across four repositories — the
+Four defects, all observed during a real handover across four repositories — the
 kind where someone inherits a codebase and has to find out what the last person knew.
-Every one of them failed the same way: silently, in a manner indistinguishable from
-"this repo has nothing recorded".
+Every one failed the same way: silently, in a manner indistinguishable from "this
+repo has nothing recorded".
 
 Format spec goes to **0.4**. The upgrade is additive; no store needs migrating.
 See [SPEC.md](SPEC.md#compatibility).
@@ -88,20 +88,23 @@ Read commands now compare the session files against the index:
 `repair` now preserves `tags` and `index_version` from the existing index, and
 backfills `digest` and `links`.
 
-### `cogitlog context` exists
-
-`cogitlog-mcp` has exposed a `cogitlog_context` tool since its first commit, and its
-instructions tell agents to call it *before modifying any file*. The command was
-never implemented. The first cogitlog call an agent made returned
-`error: unknown command 'context'` — a bad first impression from the tool its own
-instructions push hardest.
-
-`cogitlog context <file>` shows every event referencing a file, newest session
-first, including the failed attempts and unresolved doubts that `why` filters out.
-`--brief` limits it to the last 3 sessions, one line per event.
-
 ### Also
 
 - `close` derives `index_version` from the existing entry instead of hardcoding `2`.
 - `why` and `context` suggest `query` when a file has no recorded history.
 - `status` reports the session count when idle.
+
+### Note on 0.7.0
+
+0.7.0 added `cogitlog context` and a reading-first hint block. This release keeps both
+and goes further: `context` now uses descriptions, sorts newest-first, takes `-n`, and
+drops the `close` events that used to match nearly every file. The hint block gained
+markers, the "no install needed" fact, and the reason to read before editing.
+
+## 0.7.0
+
+- `cogitlog context <file>` — all reasoning related to a file, with `--brief`.
+- Reading commands listed in the generated instruction block.
+- `remindme --force` to replace an existing section.
+- Claude Code integration: session hooks and `install-skills`.
+- Path normalization so `./src/a.ts` and `src/a.ts` match.

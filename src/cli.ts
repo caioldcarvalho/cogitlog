@@ -155,7 +155,14 @@ async function promptOutcome(): Promise<SessionOutcome> {
 
 // ─── Program ─────────────────────────────────────────────────────────────────
 
-const VERSION = '0.9.0'
+// Read, not hardcoded: a literal here drifted from package.json for a whole release.
+const VERSION: string = (() => {
+  try {
+    return JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8')).version
+  } catch {
+    return '0.0.0'
+  }
+})()
 
 const program = new Command()
 program

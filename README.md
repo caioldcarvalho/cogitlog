@@ -49,6 +49,7 @@ and secrets are filtered out. The session lands in `.cogitlog/` and goes out wit
 next commit. Recording by hand still works, and wins when both exist.
 
 `cogitlog observe --dry-run` shows what would be recorded for `HEAD`.
+A repo that should never be observed: `git config cogitlog.observe false`.
 
 ## Reading someone else's log
 

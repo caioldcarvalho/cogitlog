@@ -243,7 +243,10 @@ Rules:
 - Set "technical": false on anything that is not purely technical${isPublic
     ? `. This repository is PUBLIC: when in doubt, mark it false.` : '.'}
 - Nothing worth recording? Return an empty "events" list. Five good events beat
-  fifteen weak ones.
+  fifteen weak ones. A small docs, typo or chore commit usually has nothing: do not
+  restate what the commit message already says.
+- Record only what the transcript states plainly. If you would have to guess what a
+  remark meant, leave it out.
 
 Reply with ONLY this JSON, no prose, no code fence:
 {"intent": "<one line: what the session set out to do>",

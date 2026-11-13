@@ -28,6 +28,9 @@ import {
 import { autoFileRefs, getChangedFiles, getGitRoot, getHead, getStagedFiles, resolveFileRefs } from './git'
 import { REFRESH_COMMAND, printUpdateNotice, refreshCache, scheduleUpdateCheck } from './update'
 import { withLock } from './lock'
+import { configFile, loadConfig, runObserve, saveConfig } from './observe'
+import { execFileSync } from 'child_process'
+import os from 'os'
 import type { AttemptOutcome, FileRef, IndexEntry, SessionEvent, SessionOutcome } from './types'
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -1345,9 +1348,20 @@ hookCmd
   .command('install')
   .description('Install post-commit hook to auto-close sessions on git commit')
   .option('--remind', 'Also install a pre-commit hook that warns when a commit has no recorded reasoning')
-  .action((opts: { remind?: boolean }) => {
+  .option('--global', 'Install the observer in the global core.hooksPath instead: every commit in a repo you own gets its reasoning recorded, with no per-repo setup')
+  .action((opts: { remind?: boolean; global?: boolean }) => {
+    if (opts.global) { installGlobalHook(); return }
     const gitRoot = getGitRoot()
     if (!gitRoot) { console.error('Not inside a git repository'); process.exit(1) }
+
+    // With core.hooksPath set, git never looks at .git/hooks: writing there would
+    // "succeed" and do nothing at all.
+    const hooksPath = gitConfigGet('core.hooksPath')
+    if (hooksPath) {
+      console.error(`warning: core.hooksPath is set (${hooksPath}), so git ignores .git/hooks.`)
+      console.error('  The hooks below will not run unless that directory forwards to them.')
+      console.error('  To record reasoning on every commit instead: cogitlog hook install --global')
+    }
 
     const post = installHookScript(gitRoot, 'post-commit', POST_COMMIT_SCRIPT)
     console.log(post === 'present'
@@ -1377,6 +1391,140 @@ hookCmd
     console.log(removed.length > 0
       ? `Removed cogitlog hook(s): ${removed.join(', ')}`
       : 'No cogitlog hooks found')
+  })
+
+function gitConfigGet(key: string): string {
+  try {
+    return execFileSync('git', ['config', '--get', key], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim()
+  } catch {
+    return ''
+  }
+}
+
+const GLOBAL_MARK = '# cogitlog global post-commit'
+
+// Chains the repo's own post-commit (git skips .git/hooks once core.hooksPath is
+// set, so without this every husky-style hook would go silent), keeps its exit
+// status, and runs the observer detached so a commit never waits on a model.
+const GLOBAL_POST_COMMIT = `#!/bin/sh
+${GLOBAL_MARK} — records the reasoning behind each commit (cogitlog observe)
+set -u
+COMMON=$(git rev-parse --git-common-dir 2>/dev/null) || exit 0
+status=0
+if [ -x "$COMMON/hooks/post-commit" ]; then
+  "$COMMON/hooks/post-commit" "$@"
+  status=$?
+fi
+if [ -z "\${COGITLOG_SKIP:-}" ] && [ -z "\${COGITLOG_OBSERVING:-}" ] && command -v cogitlog >/dev/null 2>&1; then
+  C=$(git rev-parse HEAD 2>/dev/null)
+  ( cogitlog observe --auto --commit "$C" </dev/null >/dev/null 2>&1 & )
+fi
+exit $status
+`
+
+function installGlobalHook(): void {
+  let dir = gitConfigGet('core.hooksPath')
+  if (!dir) {
+    dir = path.join(process.env.XDG_CONFIG_HOME ?? path.join(os.homedir(), '.config'), 'git', 'hooks')
+    execFileSync('git', ['config', '--global', 'core.hooksPath', dir])
+    console.log(`Set global core.hooksPath to ${dir}`)
+  }
+  dir = dir.replace(/^~(?=\/|$)/, os.homedir())
+  fs.mkdirSync(dir, { recursive: true })
+  const file = path.join(dir, 'post-commit')
+  if (fs.existsSync(file) && !fs.readFileSync(file, 'utf8').includes(GLOBAL_MARK)) {
+    console.error(`${file} already exists and is not cogitlog's. Not touching it.`)
+    console.error('Add this line to it to enable the observer:')
+    console.error('  ( cogitlog observe --auto --commit "$(git rev-parse HEAD)" </dev/null >/dev/null 2>&1 & )')
+    process.exit(1)
+  }
+  fs.writeFileSync(file, GLOBAL_POST_COMMIT)
+  fs.chmodSync(file, 0o755)
+  console.log(`Installed observer hook: ${file}`)
+  const cfg = loadConfig()
+  if (cfg.owners.length === 0) {
+    console.log('No owners configured yet: only repos without a remote will be observed.')
+    console.log('  cogitlog config owner add <github-user-or-org>')
+  } else {
+    console.log(`Observing repos owned by: ${cfg.owners.join(', ')} (and repos with no remote)`)
+  }
+}
+
+// ── observe ───────────────────────────────────────────────────────────────────
+
+program
+  .command('observe')
+  .description("Record a commit's reasoning from the Claude Code transcript that produced it")
+  .option('--commit <sha>', 'Commit to observe (default: HEAD)')
+  .option('--auto', 'Hook mode: skip repos you do not own, merges and rebases; log instead of printing')
+  .option('--dry-run', 'Show what would be recorded, write nothing')
+  .option('--model <model>', 'Model for the extraction (default: config model, else haiku)')
+  .action(async (opts: { commit?: string; auto?: boolean; dryRun?: boolean; model?: string }) => {
+    const repoRoot = getGitRoot()
+    if (!repoRoot) { if (!opts.auto) console.error('Not inside a git repository'); process.exit(opts.auto ? 0 : 1) }
+
+    const logFile = path.join(repoRoot, '.cogitlog', 'observe.log')
+    const log = (msg: string) => {
+      if (!opts.auto) { console.error(msg); return }
+      try {
+        if (!fs.existsSync(path.dirname(logFile))) return
+        fs.appendFileSync(logFile, `${new Date().toISOString()} ${msg}\n`)
+      } catch { /* logging must never fail the hook */ }
+    }
+
+    try {
+      const r = await runObserve({ repoRoot, commit: opts.commit, auto: opts.auto, dryRun: opts.dryRun, model: opts.model, log })
+      if (r.status === 'skipped' && opts.auto) return
+      if (r.status === 'written' || r.status === 'dry-run') {
+        if (!opts.auto) {
+          console.log(r.status === 'written' ? `Recorded session ${r.sessionId}:` : 'Would record:')
+          for (const e of r.events ?? []) {
+            const tag = e.type === 'attempt' ? `attempt (${e.outcome})` : e.type
+            console.log(`  ${tag}: ${e.description || e.body}`)
+          }
+        }
+      } else {
+        log(`${r.status}: ${r.reason}`)
+      }
+    } catch (err: any) {
+      log(`observe failed: ${err?.message ?? err}`)
+      if (!opts.auto) process.exit(1)
+    }
+  })
+
+// ── config ────────────────────────────────────────────────────────────────────
+
+const configCmd = program.command('config').description('Machine-wide observer settings (~/.config/cogitlog/config.json)')
+
+configCmd
+  .command('show')
+  .action(() => {
+    console.log(configFile())
+    console.log(JSON.stringify(loadConfig(), null, 2))
+  })
+
+configCmd
+  .command('owner <action> [name]')
+  .description('add | remove | list — GitHub users/orgs whose repos the observer records')
+  .action((action: string, name?: string) => {
+    const cfg = loadConfig()
+    if (action === 'list') { console.log(cfg.owners.join('\n') || '(none)'); return }
+    if (!name) { console.error('Usage: cogitlog config owner add|remove <name>'); process.exit(1) }
+    if (action === 'add') cfg.owners = Array.from(new Set([...cfg.owners, name]))
+    else if (action === 'remove') cfg.owners = cfg.owners.filter(o => o !== name)
+    else { console.error('action must be add, remove or list'); process.exit(1) }
+    saveConfig(cfg)
+    console.log(`owners: ${cfg.owners.join(', ') || '(none)'}`)
+  })
+
+configCmd
+  .command('model <model>')
+  .description('Model the observer uses (default haiku)')
+  .action((model: string) => {
+    const cfg = loadConfig()
+    cfg.model = model
+    saveConfig(cfg)
+    console.log(`model: ${model}`)
   })
 
 // ── agent hooks (Claude Code integration) ────────────────────────────────────
@@ -1444,7 +1592,11 @@ hookCmd
     if (!filePath) return
 
     const p = vgPaths(vgDir)
-    const needle = normFile(filePath)
+    // Claude Code passes absolute paths; the store keeps them relative to the repo
+    // root. Comparing the two as-is matched nothing, ever.
+    const repoRoot = path.dirname(vgDir)
+    const needle = normFile(path.isAbsolute(filePath) ? path.relative(repoRoot, filePath) : filePath)
+    if (needle.startsWith('..')) return
     const entries = readIndex(p.index)
       .filter(e => e.files.some(f => normFile(f) === needle))
       .sort((a, b) => (b.started_at > a.started_at ? 1 : -1))
@@ -1473,7 +1625,10 @@ hookCmd
     }
 
     if (lines.length > 1) {
-      console.log(lines.join('\n'))
+      // PreToolUse stdout is not shown to the model unless it is wrapped like this.
+      console.log(JSON.stringify({
+        hookSpecificOutput: { hookEventName: 'PreToolUse', additionalContext: lines.join('\n') },
+      }))
     }
   })
 
@@ -1493,7 +1648,9 @@ hookCmd
     let input: any
     try { input = JSON.parse(raw) } catch { return }
 
-    const userMessage = input?.message ?? input?.content ?? ''
+    // Claude Code sends the text as `prompt`. Older builds of this hook read
+    // `message`/`content`, which never exist, so every session became "Auto-session".
+    const userMessage = input?.prompt ?? input?.message ?? input?.content ?? ''
     const intent = typeof userMessage === 'string' && userMessage.length > 0
       ? userMessage.slice(0, 120)
       : 'Auto-session'
@@ -1644,7 +1801,7 @@ hookCmd
 // ── install-skills ───────────────────────────────────────────────────────────
 
 const SKILL_READ = `---
-description: Check cogitlog history before working on a file or topic. Usage: /cogitlog-read <file-or-topic> (e.g. /cogitlog-read src/cli.ts, /cogitlog-read "auth flow")
+description: Check why a file or topic is the way it is before changing it — past decisions, failed attempts and rejected alternatives recorded in .cogitlog/. Usage: /cogitlog-read <file-or-topic> (e.g. /cogitlog-read src/cli.ts, /cogitlog-read "auth flow")
 ---
 
 ## User Input
@@ -1653,54 +1810,39 @@ description: Check cogitlog history before working on a file or topic. Usage: /c
 $ARGUMENTS
 \`\`\`
 
-Parse the argument to determine if it's a **file path** or a **topic/keyword**.
+If it contains \`/\` or a file extension, treat it as a **file**; otherwise as a **topic**.
 
-- If it looks like a file path (contains \`/\` or \`.\`): treat as a file
-- Otherwise: treat as a topic
+## File
 
-## If File Path
+Run both:
 
-Run these cogitlog queries in parallel:
+    cogitlog why <file>               # decisions that touched it
+    cogitlog context <file> --brief   # every event about it, last 3 sessions
 
-1. **\`cogitlog_why\`** on the file — to see past decisions that affected it
-2. **\`cogitlog_context\`** on the file with \`brief: true\` — to see all reasoning events
+## Topic
 
-## If Topic
-
-Run this cogitlog query:
-
-1. **\`cogitlog_query\`** with \`deep: true\` — to search sessions by topic, including event bodies
-
-## Also Run
-
-- **\`cogitlog_log\`** with \`limit: 5\` — to show recent sessions for general awareness
+    cogitlog query "<topic>"          # searches descriptions, bodies, rejected alternatives
 
 ## Output
 
-Summarize what you found in a concise format:
+Summarize, most useful first:
 
-### Cogitlog Context: {file or topic}
+- **Failed attempts** on this file/topic — what was tried, why it failed. These stop
+  you from walking back into a dead end; lead with them.
+- **Decisions** and the alternatives they rejected.
+- **Open uncertainties.**
 
-**Recent decisions:**
-- (list decisions with session IDs and dates)
+Events tagged \`observed\` were extracted from an agent transcript at commit time and
+carry an \`evidence\` quote; treat them as reliable but secondhand.
 
-**Key notes/events:**
-- (list relevant notes, attempts, uncertainties)
+If nothing turns up, say so in one line: "No cogitlog history for {target}."
+No CLI installed? Read \`.cogitlog/sessions/*.jsonl\` directly — it is plain JSONL.
 
-**Active session:**
-- Whether there's a currently open session (from \`cogitlog_status\`)
-
-If nothing was found, say so clearly: "No prior cogitlog history found for {target}."
-
-## Operating Principles
-
-- This is **read-only** — no sessions are opened, no events are recorded
-- Always run this before modifying files that have been touched in prior sessions
-- Surface surprises: if a past decision contradicts the current plan, flag it prominently
+This skill is read-only: it opens no session and records nothing.
 `
 
 const SKILL_WRITE = `---
-description: Open a cogitlog session for the current task. Usage: /cogitlog-write <intent> (e.g. /cogitlog-write "fix redirect loop in auth middleware")
+description: Record a decision, failed attempt or open doubt in cogitlog by hand, when it is too subtle to trust to the commit-time observer. Usage: /cogitlog-write <what to record>
 ---
 
 ## User Input
@@ -1709,47 +1851,26 @@ description: Open a cogitlog session for the current task. Usage: /cogitlog-writ
 $ARGUMENTS
 \`\`\`
 
-The argument is the **intent** — what you're about to do.
+If \`cogitlog hook install --global\` is set up, the observer already extracts the
+reasoning of each commit from the agent transcript — routine decisions need nothing
+from you. Write by hand only what the observer would miss or blur: a subtle trade-off,
+a constraint that came from outside the conversation, a doubt you want the next
+person to see.
 
-## Step 1: Check Current Status
+## How
 
-Run **\`cogitlog_status\`** to see if there's already an open session.
+    cogitlog status                                   # is a session open?
+    cogitlog begin "<intent>"                         # only if none is
+    cogitlog decision "<what and why>" -a "<rejected option>:<why not>" -f <file>
+    cogitlog attempt "<what you tried>" failed --reason "<why it failed>" -f <file>
+    cogitlog uncertainty "<the doubt>"
+    cogitlog note "<non-obvious fact>"
 
-- If there's an open session that matches the current intent, **do not open a new one**. Tell the user the session is already open and continue.
-- If there's an open session for a *different* task, it will be auto-closed as \`interrupted\` when you open the new one. Warn the user about this before proceeding.
+Leave the session open: the next commit closes it, and a session recorded by hand
+during a commit's window makes the observer stand down for that commit.
 
-## Step 2: Open the Session
-
-Run **\`cogitlog_begin\`** with:
-- \`intent\`: the user's argument
-- \`tags\`: infer 1-3 relevant tags from the intent (e.g., \`["bugfix", "auth"]\`, \`["feature", "cli"]\`)
-
-## Step 3: Confirm and Remind
-
-Tell the user:
-
-> Session opened: "{intent}"
->
-> During this task, I will log events using:
-> - \`cogitlog_decision\` — when making important choices
-> - \`cogitlog_note\` — when discovering something relevant
-> - \`cogitlog_attempt\` — when trying a solution (with outcome)
-> - \`cogitlog_uncertainty\` — when something is unclear
->
-> When done, I'll close with \`cogitlog_close\`.
-
-## IMPORTANT — Ongoing Behavior
-
-After opening the session, you MUST continue logging events throughout the rest of the conversation:
-
-- **Before modifying a file**: run \`cogitlog_why\` on it first
-- **When you make a non-obvious choice**: log a \`cogitlog_decision\` with alternatives considered
-- **When you try something**: log a \`cogitlog_attempt\` with the outcome
-- **When you discover something unexpected**: log a \`cogitlog_note\`
-- **When you're unsure about something**: log a \`cogitlog_uncertainty\`
-- **When the task is done**: run \`cogitlog_close\` with the appropriate outcome
-
-Do NOT forget to close the session. If the user moves on to a different topic without explicitly closing, close the session as \`completed\` or \`partial\` based on what was accomplished.
+A failed attempt is worth more than a successful one — it is what stops the next
+person from walking back into the same dead end.
 `
 
 program

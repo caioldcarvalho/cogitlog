@@ -1,4 +1,4 @@
-# cogitlog format spec v0.4
+# cogitlog format spec v0.5
 
 Semantic memory protocol for AI agents working in codebases.
 Lives alongside git in `.cogitlog/`. Does not replace git.
@@ -29,7 +29,7 @@ Written once on `cogitlog init`. Never updated automatically.
 
 ```jsonc
 {
-  "spec_version": "0.4",
+  "spec_version": "0.5",
   "created_at": "2026-03-31T10:42:17Z",
   "update_check": true    // optional; set false to silence CLI update notices in this repo
 }
@@ -327,3 +327,16 @@ Session files are never rewritten by an upgrade. Existing events keep the exact 
 4. **Git-aware, not git-dependent.** Commit hashes are best-effort. cogitlog works in repos with no commits.
 5. **Interrupted is not failed.** A session that ends due to context limits or process death is `interrupted`, not `abandoned`. The intent survived even if the session didn't.
 6. **Forward-compatible.** Unknown fields are silently ignored. Readers that encounter an unsupported `spec_version` must warn and degrade, not crash.
+
+
+## 0.4 → 0.5: observed events
+
+Additive. Events extracted by `cogitlog observe` carry two optional fields:
+
+- `source`: `"observer"`. Absent means the event was written by hand.
+- `evidence` (prose events only): the verbatim transcript quote the event was
+  validated against.
+
+Observed sessions are tagged `observed` and `commit:<first 12 chars of the sha>` in the
+index, and their `agent.tool` is `cogitlog-observer`. Readers that do not know these
+fields ignore them, as with every addition.

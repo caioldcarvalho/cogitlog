@@ -31,6 +31,25 @@ cogitlog uncertainty "not sure if prefers-color-scheme should override manual to
 cogitlog close --outcome completed
 ```
 
+## Recording without remembering
+
+Asking an agent to log while it works fails the same way every time: it forgets.
+So let it forget.
+
+```sh
+cogitlog hook install --global              # once per machine
+cogitlog config owner add <your-github-user>
+```
+
+From then on every commit in a repo you own is **observed**: the Claude Code
+transcript that produced it is read by a small model (`claude -p`, haiku), which
+extracts decisions, failed attempts, rejected alternatives and open doubts. Each event
+must quote its evidence verbatim from the transcript or it is dropped; personal content
+and secrets are filtered out. The session lands in `.cogitlog/` and goes out with your
+next commit. Recording by hand still works, and wins when both exist.
+
+`cogitlog observe --dry-run` shows what would be recorded for `HEAD`.
+
 ## Reading someone else's log
 
 Inheriting a repo that has a `.cogitlog/` is the case this exists for:

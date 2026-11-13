@@ -1,5 +1,62 @@
 # Changelog
 
+## 0.10.0
+
+The record no longer depends on anyone remembering to write it.
+
+Every earlier release tried to make writing easier — shorter commands, reminders at
+commit time. None of it worked for the reason that matters: an agent in the middle of
+a task forgets, and so does a person. So the writing moves out of the actor's hands.
+
+### The observer
+
+`cogitlog observe` reads the Claude Code transcript that produced a commit, asks a
+small model (`claude -p`, haiku by default) to extract decisions, failed attempts,
+rejected alternatives and open doubts, and records them as a session tagged
+`observed`.
+
+- **Nothing is taken on faith.** Each event must carry an `evidence` quote that is
+  found verbatim in the transcript; anything else is dropped. Files are cut down to
+  the ones the commit touched.
+- **Technical only.** Emails, tokens, phone numbers and home paths are redacted; the
+  model is told to mark anything personal, and those events are dropped. Public
+  repositories (checked once with `gh`, cached in `git config cogitlog.public`) get a
+  stricter instruction. Unknown visibility counts as public.
+- **Hand-written records win.** If a session recorded by hand covers the commit, the
+  observer stands down. Each commit is observed at most once.
+- The extraction runs from an empty temp directory with project-only settings and no
+  session persistence: it loads none of your hooks and leaves no transcript behind
+  for a later commit to observe.
+
+### Turning it on once, for every repo
+
+`cogitlog hook install --global` writes a `post-commit` into your global
+`core.hooksPath`. It chains the repo's own `post-commit`, keeps its exit status, and
+runs the observer detached — a commit never waits on a model. The record of commit N
+lands in the working tree and goes out with commit N+1.
+
+It only acts in repos you own: `cogitlog config owner add <github-user>` lists them;
+repos with no remote always count; forks and other people's repos are left alone. The
+first observed commit creates `.cogitlog/` without touching the repo's CLAUDE.md or
+AGENTS.md.
+
+### Fixes
+
+- `hook agent-begin` read the prompt from fields Claude Code never sends, so every
+  automatic session was called "Auto-session". It reads `prompt` now.
+- `hook agent-pre-tool` never injected anything: Claude Code passes absolute paths and
+  the store keeps repo-relative ones, and PreToolUse output is only shown to the model
+  when wrapped as `hookSpecificOutput.additionalContext`. Both fixed.
+- `hook install` wrote to `.git/hooks` even when `core.hooksPath` is set, where git
+  never looks. It warns now and points to `--global`.
+- `install-skills` installs CLI-based skills; they no longer assume the MCP server.
+
+### Also
+
+- A test suite (`npm test`, node:test, no new dependencies). CI runs it before
+  publishing.
+- Spec 0.5: optional `source: "observer"` and `evidence` on events.
+
 ## 0.9.0
 
 Two things agents and people forget: to record anything at all, and to update the CLI.

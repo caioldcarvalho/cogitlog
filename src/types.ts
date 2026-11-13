@@ -27,6 +27,11 @@ interface ProseEvent extends BaseEvent {
   body: string
   description?: string | null
   links?: string[]
+  /** Spec 0.5+. "observer" when `cogitlog observe` extracted this event from an agent
+   *  transcript instead of someone recording it. Absent means written by hand. */
+  source?: 'observer'
+  /** Spec 0.5+, observer only. The verbatim transcript quote the event was checked against. */
+  evidence?: string
 }
 
 export interface BeginEvent extends BaseEvent {
@@ -35,6 +40,7 @@ export interface BeginEvent extends BaseEvent {
   context: string | null
   git_head: string | null
   resumed_from: string | null
+  source?: 'observer'
 }
 
 export interface NoteEvent extends ProseEvent {

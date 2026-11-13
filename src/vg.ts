@@ -1,7 +1,7 @@
 import fs from 'fs'
 import path from 'path'
 
-export const SPEC_VERSION = '0.4'
+export const SPEC_VERSION = '0.5'
 export const AGENT_TOOL = 'cogitlog-cli'
 
 export function findVibegitDir(startDir = process.cwd()): string | null {

@@ -38,7 +38,7 @@ lands in the working tree and goes out with commit N+1.
 It only acts in repos you own: `cogitlog config owner add <github-user>` lists them;
 repos with no remote always count; forks and other people's repos are left alone. The
 first observed commit creates `.cogitlog/` without touching the repo's CLAUDE.md or
-AGENTS.md.
+AGENTS.md. A repo can opt out with `git config cogitlog.observe false`.
 
 ### Fixes
 

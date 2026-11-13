@@ -467,6 +467,7 @@ export async function runObserve(opts: ObserveOptions): Promise<ObserveResult> {
       if (gitDir && fs.existsSync(path.join(gitDir, marker))) return { status: 'skipped', reason: marker }
     }
     if (!isEligible(remote, cfg.owners)) return { status: 'skipped', reason: 'not an owned repo' }
+    if (git(['config', '--get', 'cogitlog.observe'], repoRoot) === 'false') return { status: 'skipped', reason: 'opted out' }
   }
 
   const untilIso = git(['show', '-s', '--format=%cI', sha], repoRoot)

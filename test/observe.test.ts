@@ -222,3 +222,10 @@ test('runObserve --auto skips repos owned by someone else', async () => {
   assert.equal(r.status, 'skipped')
   assert.equal(r.reason, 'not an owned repo')
 })
+
+test('runObserve --auto respects git config cogitlog.observe=false', async () => {
+  const repo = gitRepo()
+  execFileSync('git', ['config', 'cogitlog.observe', 'false'], { cwd: repo })
+  const r = await runObserve({ repoRoot: repo, auto: true, runner: () => { throw new Error('must not run') } })
+  assert.equal(r.reason, 'opted out')
+})

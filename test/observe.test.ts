@@ -61,19 +61,32 @@ test('ignores other repos, the time window, sidechains and duplicated request bl
   const dir = tmp()
   transcript(dir, 's1.jsonl', [
     user('outside the window', at(9)),
-    user('other repo', at(11), '/work/other'),
     { ...user('sidechain'), isSidechain: true },
     { type: 'api-request-blob', cwd: REPO, timestamp: at(11), message: { role: 'user', content: 'dup' } },
     user('kept'),
   ])
+  transcript(dir, 's2.jsonl', [user('other repo, other session', at(11), '/work/other')])
   const { items } = collectTranscript(dir, REPO, T0, T1)
   assert.deepEqual(items.map(i => i.text), ['kept'])
 })
 
 test('subdirectories of the repo count; a sibling with the same prefix does not', () => {
   const dir = tmp()
-  transcript(dir, 's1.jsonl', [user('sub', at(11), '/work/proj/pkg'), user('sibling', at(11), '/work/project2')])
+  transcript(dir, 's1.jsonl', [user('sub', at(11), '/work/proj/pkg')])
+  transcript(dir, 's2.jsonl', [user('sibling', at(11), '/work/project2')])
   assert.deepEqual(collectTranscript(dir, REPO, T0, T1).items.map(i => i.text), ['sub'])
+})
+
+test('a session that touched the repo brings its conversation, but not its outside tool calls', () => {
+  const dir = tmp()
+  transcript(dir, 's1.jsonl', [
+    user('lets keep the store in the repo', at(10), '/work/elsewhere'),
+    assistant([{ type: 'tool_use', name: 'Bash', input: { command: 'ls elsewhere' } }], at(10), '/work/elsewhere'),
+    user('now build it', at(11)),
+  ])
+  transcript(dir, 's2.jsonl', [user('unrelated session', at(11), '/work/elsewhere')])
+  const texts = collectTranscript(dir, REPO, T0 - 3600_000, T1).items.map(i => i.text)
+  assert.deepEqual(texts, ['lets keep the store in the repo', 'now build it'])
 })
 
 test('strips system reminders, inline control tags and rejected tool calls', () => {

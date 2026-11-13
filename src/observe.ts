@@ -88,24 +88,29 @@ export function collectTranscript(
     for (const f of files) {
       const file = path.join(pdir, f)
       try { if (fs.statSync(file).mtimeMs < sinceMs) continue } catch { continue }
+      const evts: any[] = []
       for (const line of fs.readFileSync(file, 'utf8').split('\n')) {
         if (!line.trim()) continue
         let evt: any
         try { evt = JSON.parse(line) } catch { continue }
         if (evt.type !== 'user' && evt.type !== 'assistant') continue
-        if (evt.isSidechain) continue
-        if (!insideRepo(evt.cwd, repoRoot) || !within(evt.timestamp, sinceMs, untilMs)) continue
-        const before = items.length
-        pushItems(items, evt, repoRoot)
-        if (items.length > before) sources.add(path.basename(f, '.jsonl'))
+        if (evt.isSidechain || !within(evt.timestamp, sinceMs, untilMs)) continue
+        evts.push(evt)
       }
+      // The why is usually argued in conversation before anyone cd's into the repo.
+      // So a session that worked in the repo contributes all of its CONVERSATION in
+      // the window; its tool calls only count when they ran inside the repo.
+      if (!evts.some(e => insideRepo(e.cwd, repoRoot))) continue
+      const before = items.length
+      for (const evt of evts) pushItems(items, evt, repoRoot, insideRepo(evt.cwd, repoRoot))
+      if (items.length > before) sources.add(path.basename(f, '.jsonl'))
     }
   }
   items.sort((a, b) => (a.at < b.at ? -1 : a.at > b.at ? 1 : 0))
   return { items, sources: Array.from(sources) }
 }
 
-function pushItems(items: TranscriptItem[], evt: any, repoRoot: string): void {
+function pushItems(items: TranscriptItem[], evt: any, repoRoot: string, inRepo = true): void {
   const at = evt.timestamp
   const content = evt.message?.content
   if (evt.type === 'user') {
@@ -117,6 +122,7 @@ function pushItems(items: TranscriptItem[], evt: any, repoRoot: string): void {
     if (!Array.isArray(content)) return
     for (const c of content) {
       if (c?.type === 'tool_result' && c.is_error) {
+        if (!inRepo) continue
         const raw = typeof c.content === 'string' ? c.content : JSON.stringify(c.content ?? '')
         if (/doesn't want to proceed|tool use was rejected/i.test(raw)) continue
         items.push({ at, kind: 'error', text: clip(clean(raw), ERROR_CAP) })
@@ -132,7 +138,7 @@ function pushItems(items: TranscriptItem[], evt: any, repoRoot: string): void {
     if (c?.type === 'text' && c.text) {
       const t = clean(c.text)
       if (t) items.push({ at, kind: 'assistant', text: clip(t, ITEM_CAP) })
-    } else if (c?.type === 'tool_use') {
+    } else if (c?.type === 'tool_use' && inRepo) {
       const input = c.input ?? {}
       if (typeof input.file_path === 'string' && /^(Edit|Write|MultiEdit|NotebookEdit)$/.test(c.name)) {
         items.push({ at, kind: 'edit', text: relPath(input.file_path, repoRoot) })

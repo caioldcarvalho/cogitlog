@@ -89,6 +89,38 @@ test('a session that touched the repo brings its conversation, but not its outsi
   assert.deepEqual(texts, ['lets keep the store in the repo', 'now build it'])
 })
 
+test('a session opened elsewhere counts when its tools reach into the repo', () => {
+  const dir = tmp()
+  const away = '/home/me/notes'
+  transcript(dir, 's1.jsonl', [
+    user('the modal is trapped in the sidebar, portal it', at(11), away),
+    assistant([
+      { type: 'tool_use', id: 't1', name: 'Bash', input: { command: 'cd ~/work/proj && npm test' } },
+      { type: 'tool_use', id: 't2', name: 'Edit', input: { file_path: '/home/me/work/proj/src/Modal.svelte' } },
+      { type: 'tool_use', id: 't3', name: 'Bash', input: { command: 'git -C /home/me/notes status' } },
+    ], at(11), away),
+    { type: 'user', cwd: away, timestamp: at(11), message: { role: 'user', content: [
+      { type: 'tool_result', tool_use_id: 't1', is_error: true, content: 'Error: 1 test failed' },
+      { type: 'tool_result', tool_use_id: 't3', is_error: true, content: 'fatal: not a repo' }] } },
+  ])
+  const items = collectTranscript(dir, '/home/me/work/proj', T0, T1, '/home/me').items
+  assert.deepEqual(items.map(i => `${i.kind}:${i.text}`), [
+    'user:the modal is trapped in the sidebar, portal it',
+    'bash:cd ~/work/proj && npm test',
+    'edit:src/Modal.svelte',
+    'error:Error: 1 test failed',
+  ])
+})
+
+test('a command naming a sibling with the same prefix does not count', () => {
+  const dir = tmp()
+  transcript(dir, 's1.jsonl', [
+    user('elsewhere', at(11), '/home/me/notes'),
+    assistant([{ type: 'tool_use', id: 't1', name: 'Bash', input: { command: 'cd $HOME/work/project2 && ls' } }], at(11), '/home/me/notes'),
+  ])
+  assert.deepEqual(collectTranscript(dir, '/home/me/work/proj', T0, T1, '/home/me').items, [])
+})
+
 test('strips system reminders, inline control tags and rejected tool calls', () => {
   const dir = tmp()
   transcript(dir, 's1.jsonl', [

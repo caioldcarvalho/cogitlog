@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+- **Sessions opened outside the repo now count.** The observer used to require a
+  transcript event whose cwd was inside the repo. A session opened in another
+  directory that worked on the repo through absolute paths (`Edit` on its files,
+  `cd ~/work/repo && npm test`) never changes its cwd, so its commits came back
+  empty. A tool call now counts when it runs inside the repo, names a file inside
+  it, or is a shell command that spells the repo's path (absolute, `~/` or `$HOME/`).
+  Errors from those calls come along too.
+
 ## 0.10.0
 
 The record no longer depends on anyone remembering to write it.

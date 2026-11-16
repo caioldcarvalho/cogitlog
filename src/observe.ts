@@ -66,6 +66,32 @@ function insideRepo(cwd: unknown, repoRoot: string): boolean {
   return rel === '' || (!rel.startsWith('..') && !path.isAbsolute(rel))
 }
 
+const escapeRe = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+
+/** The ways a shell command can spell the repo's path: absolute, and with ~ or $HOME when it sits under home. */
+function repoSpellings(repoRoot: string, home: string): RegExp {
+  const forms = [repoRoot]
+  const rel = home && home !== '/' ? path.relative(home, repoRoot) : '..'
+  if (!rel.startsWith('..') && !path.isAbsolute(rel)) forms.push(`~/${rel}`, `$HOME/${rel}`, `\${HOME}/${rel}`)
+  // The path must end where the word ends, or /work/proj would match /work/project2.
+  return new RegExp(`(?:${forms.map(escapeRe).join('|')})(?=$|[/\\s'";&|)])`)
+}
+
+/**
+ * Whether a tool call worked on the repo. Running inside it counts; so does reaching into it
+ * from elsewhere (a session opened in another directory that edits the repo's files or
+ * `cd`s into it in a command), since the cwd then never changes.
+ */
+function touchesRepo(c: any, cwd: unknown, repoRoot: string, spelled: RegExp): boolean {
+  if (insideRepo(cwd, repoRoot)) return true
+  const input = c?.input ?? {}
+  for (const key of ['file_path', 'notebook_path', 'path']) {
+    const v = input[key]
+    if (typeof v === 'string' && insideRepo(path.resolve(typeof cwd === 'string' ? cwd : '/', v), repoRoot)) return true
+  }
+  return c?.name === 'Bash' && typeof input.command === 'string' && spelled.test(input.command)
+}
+
 /**
  * Read every Claude Code transcript event that happened inside `repoRoot` during
  * the window. Only `user` and `assistant` lines count: transcripts also carry
@@ -76,9 +102,11 @@ export function collectTranscript(
   repoRoot: string,
   sinceMs: number,
   untilMs: number,
+  home = os.homedir(),
 ): { items: TranscriptItem[]; sources: string[] } {
   const items: TranscriptItem[] = []
   const sources = new Set<string>()
+  const spelled = repoSpellings(repoRoot, home)
   if (!fs.existsSync(dir)) return { items, sources: [] }
 
   for (const project of fs.readdirSync(dir)) {
@@ -99,10 +127,18 @@ export function collectTranscript(
       }
       // The why is usually argued in conversation before anyone cd's into the repo.
       // So a session that worked in the repo contributes all of its CONVERSATION in
-      // the window; its tool calls only count when they ran inside the repo.
-      if (!evts.some(e => insideRepo(e.cwd, repoRoot))) continue
+      // the window; its tool calls only count when they worked on the repo.
+      // The calls themselves, and their ids so an error result can find its call.
+      const touched = new Set<unknown>()
+      for (const e of evts) {
+        if (e.type !== 'assistant' || !Array.isArray(e.message?.content)) continue
+        for (const c of e.message.content) {
+          if (c?.type === 'tool_use' && touchesRepo(c, e.cwd, repoRoot, spelled)) { touched.add(c); if (c.id) touched.add(c.id) }
+        }
+      }
+      if (!touched.size && !evts.some(e => insideRepo(e.cwd, repoRoot))) continue
       const before = items.length
-      for (const evt of evts) pushItems(items, evt, repoRoot, insideRepo(evt.cwd, repoRoot))
+      for (const evt of evts) pushItems(items, evt, repoRoot, insideRepo(evt.cwd, repoRoot), touched)
       if (items.length > before) sources.add(path.basename(f, '.jsonl'))
     }
   }
@@ -110,7 +146,7 @@ export function collectTranscript(
   return { items, sources: Array.from(sources) }
 }
 
-function pushItems(items: TranscriptItem[], evt: any, repoRoot: string, inRepo = true): void {
+function pushItems(items: TranscriptItem[], evt: any, repoRoot: string, inRepo = true, touched = new Set<unknown>()): void {
   const at = evt.timestamp
   const content = evt.message?.content
   if (evt.type === 'user') {
@@ -122,7 +158,7 @@ function pushItems(items: TranscriptItem[], evt: any, repoRoot: string, inRepo =
     if (!Array.isArray(content)) return
     for (const c of content) {
       if (c?.type === 'tool_result' && c.is_error) {
-        if (!inRepo) continue
+        if (!inRepo && !touched.has(c.tool_use_id)) continue
         const raw = typeof c.content === 'string' ? c.content : JSON.stringify(c.content ?? '')
         if (/doesn't want to proceed|tool use was rejected/i.test(raw)) continue
         items.push({ at, kind: 'error', text: clip(clean(raw), ERROR_CAP) })
@@ -138,7 +174,7 @@ function pushItems(items: TranscriptItem[], evt: any, repoRoot: string, inRepo =
     if (c?.type === 'text' && c.text) {
       const t = clean(c.text)
       if (t) items.push({ at, kind: 'assistant', text: clip(t, ITEM_CAP) })
-    } else if (c?.type === 'tool_use' && inRepo) {
+    } else if (c?.type === 'tool_use' && (inRepo || touched.has(c))) {
       const input = c.input ?? {}
       if (typeof input.file_path === 'string' && /^(Edit|Write|MultiEdit|NotebookEdit)$/.test(c.name)) {
         items.push({ at, kind: 'edit', text: relPath(input.file_path, repoRoot) })

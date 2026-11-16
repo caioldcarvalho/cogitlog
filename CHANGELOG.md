@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.10.1
 
 - **Sessions opened outside the repo now count.** The observer used to require a
   transcript event whose cwd was inside the repo. A session opened in another
